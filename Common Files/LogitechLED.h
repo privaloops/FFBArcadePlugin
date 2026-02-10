@@ -3,8 +3,9 @@
 #include <windows.h>
 
 // Logitech G923/G29 RPM LED controller.
-// Uses HID++ 2.0 feature discovery to find LED control on the G923 Xbox,
-// falls back to legacy [F8 12] for G29/G923-PS.
+// Phase 0: G Hub LED SDK (requires G Hub running + kernel drivers)
+// Phase 1: HID++ 2.0 feature discovery (G923 Xbox, requires G Hub closed)
+// Phase 2: Legacy [F8 12] (G29/G923-PS)
 
 class LogitechLED
 {
@@ -35,16 +36,19 @@ private:
 	bool m_available;
 	USHORT m_reportLen;
 
-	// LED method found during discovery
-	enum LEDMethod { METHOD_NONE, METHOD_LEGACY, METHOD_HIDPP };
+	enum LEDMethod { METHOD_NONE, METHOD_LEGACY, METHOD_HIDPP, METHOD_SDK };
 	LEDMethod m_method;
-	BYTE m_ledFeatureIdx;    // HID++ feature index for LED control
-	BYTE m_ledFunctionId;    // HID++ function ID for setting LEDs
-	BYTE m_deviceIdx;        // HID++ device index (0xFF=USB, 0x01=receiver)
+	BYTE m_ledFeatureIdx;
+	BYTE m_ledFunctionId;
+	BYTE m_deviceIdx;
+
+	// G Hub SDK
+	HMODULE m_sdkDll;
 
 	void EnumerateCandidates(HIDCandidate* out, int* count);
 	bool SendReport(HANDLE h, const BYTE* report, USHORT len);
 	bool ReadReport(HANDLE h, BYTE* report, USHORT len, DWORD timeoutMs);
+	bool TrySDK();
 	bool TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen);
 	bool TryLegacy(HANDLE h, USHORT outLen);
 };

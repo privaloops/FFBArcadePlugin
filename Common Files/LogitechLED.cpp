@@ -41,6 +41,27 @@ static bool IsKnownPID(USHORT pid)
 	return false;
 }
 
+// --- G Hub SDK function pointers ---
+
+typedef bool (*LogiLedInit_t)();
+typedef bool (*LogiLedInitWithName_t)(const char*);
+typedef bool (*LogiLedSetTargetDevice_t)(int);
+typedef bool (*LogiLedSetLighting_t)(int, int, int);
+typedef bool (*LogiLedSaveCurrentLighting_t)();
+typedef bool (*LogiLedRestoreLighting_t)();
+typedef void (*LogiLedShutdown_t)();
+typedef bool (*LogiLedGetSdkVersion_t)(int*, int*, int*);
+typedef bool (*LogiLedSetLightingForKeyWithKeyName_t)(int, int, int, int);
+
+static LogiLedInit_t                     g_LedInit = NULL;
+static LogiLedInitWithName_t             g_LedInitWithName = NULL;
+static LogiLedSetTargetDevice_t          g_LedSetTarget = NULL;
+static LogiLedSetLighting_t              g_LedSetLighting = NULL;
+static LogiLedSaveCurrentLighting_t      g_LedSave = NULL;
+static LogiLedRestoreLighting_t          g_LedRestore = NULL;
+static LogiLedShutdown_t                 g_LedShutdown = NULL;
+static LogiLedGetSdkVersion_t            g_LedGetVersion = NULL;
+
 // --- LogitechLED ---
 
 LogitechLED::LogitechLED()
@@ -51,6 +72,7 @@ LogitechLED::LogitechLED()
 	, m_ledFeatureIdx(0)
 	, m_ledFunctionId(0)
 	, m_deviceIdx(0xFF)
+	, m_sdkDll(NULL)
 {
 }
 
@@ -61,13 +83,26 @@ LogitechLED::~LogitechLED()
 
 void LogitechLED::Close()
 {
+	if (m_method == METHOD_SDK && g_LedShutdown)
+		g_LedShutdown();
+
+	if (m_sdkDll)
+	{
+		FreeLibrary(m_sdkDll);
+		m_sdkDll = NULL;
+	}
+
 	if (m_handle != INVALID_HANDLE_VALUE)
 	{
 		CloseHandle(m_handle);
 		m_handle = INVALID_HANDLE_VALUE;
 	}
+
 	m_available = false;
 	m_method = METHOD_NONE;
+	g_LedInit = NULL;
+	g_LedSetLighting = NULL;
+	g_LedShutdown = NULL;
 }
 
 bool LogitechLED::IsAvailable() const
@@ -75,7 +110,152 @@ bool LogitechLED::IsAvailable() const
 	return m_available;
 }
 
-// --- I/O helpers (overlapped for discovery handles) ---
+// --- Phase 0: G Hub LED SDK ---
+
+bool LogitechLED::TrySDK()
+{
+	Log("=== Phase 0: G Hub LED SDK ===");
+
+#ifdef _WIN64
+	const char* dllPath = "C:\\Program Files\\LGHUB\\sdks\\sdk_legacy_led_x64.dll";
+#else
+	const char* dllPath = "C:\\Program Files\\LGHUB\\sdks\\sdk_legacy_led_x86.dll";
+#endif
+
+	m_sdkDll = LoadLibraryA(dllPath);
+	if (!m_sdkDll)
+	{
+		Log("  DLL not found: %s (err=%lu)", dllPath, GetLastError());
+		return false;
+	}
+
+	Log("  Loaded: %s", dllPath);
+
+	// Enumerate exported functions
+	const char* probeNames[] = {
+		"LogiLedInit", "LogiLedInitWithName",
+		"LogiLedSetTargetDevice", "LogiLedSetLighting",
+		"LogiLedSaveCurrentLighting", "LogiLedRestoreLighting",
+		"LogiLedShutdown", "LogiLedGetSdkVersion",
+		"LogiLedSetLightingForKeyWithKeyName",
+		"LogiLedSetLightingForKeyWithScanCode",
+		"LogiLedSetLightingForKeyWithHidCode",
+		"LogiLedSetLightingForTargetZone",
+		"LogiLedGetConfigOptionNumber",
+		// Steering wheel SDK functions (maybe bundled?)
+		"LogiSteeringInitialize", "LogiPlayLeds",
+		"LogiIsConnected", "LogiUpdate",
+		NULL
+	};
+
+	Log("  Exported functions:");
+	for (int i = 0; probeNames[i]; i++)
+	{
+		FARPROC p = GetProcAddress(m_sdkDll, probeNames[i]);
+		if (p) Log("    %s: FOUND", probeNames[i]);
+	}
+
+	// Get function pointers
+	g_LedInit       = (LogiLedInit_t)GetProcAddress(m_sdkDll, "LogiLedInit");
+	g_LedInitWithName = (LogiLedInitWithName_t)GetProcAddress(m_sdkDll, "LogiLedInitWithName");
+	g_LedSetTarget  = (LogiLedSetTargetDevice_t)GetProcAddress(m_sdkDll, "LogiLedSetTargetDevice");
+	g_LedSetLighting = (LogiLedSetLighting_t)GetProcAddress(m_sdkDll, "LogiLedSetLighting");
+	g_LedShutdown   = (LogiLedShutdown_t)GetProcAddress(m_sdkDll, "LogiLedShutdown");
+	g_LedGetVersion = (LogiLedGetSdkVersion_t)GetProcAddress(m_sdkDll, "LogiLedGetSdkVersion");
+
+	// SDK version
+	if (g_LedGetVersion)
+	{
+		int major = 0, minor = 0, build = 0;
+		if (g_LedGetVersion(&major, &minor, &build))
+			Log("  SDK version: %d.%d.%d", major, minor, build);
+	}
+
+	// Init
+	if (!g_LedInit)
+	{
+		Log("  LogiLedInit not found");
+		FreeLibrary(m_sdkDll);
+		m_sdkDll = NULL;
+		return false;
+	}
+
+	bool ok = g_LedInit();
+	Log("  LogiLedInit() -> %s", ok ? "OK" : "FAIL");
+
+	if (!ok)
+	{
+		Log("  Is G Hub running?");
+		FreeLibrary(m_sdkDll);
+		m_sdkDll = NULL;
+		return false;
+	}
+
+	// Give G Hub a moment to enumerate devices
+	Sleep(500);
+
+	// Try setting lighting on all device types
+	if (g_LedSetTarget)
+	{
+		// LOGI_DEVICETYPE_MONOCHROME=1, RGB=2, PERKEY_RGB=4, ALL=7
+		g_LedSetTarget(0x07);  // target ALL devices
+		Log("  SetTargetDevice(ALL)");
+	}
+
+	if (g_LedSetLighting)
+	{
+		// Try full brightness
+		bool led = g_LedSetLighting(100, 100, 100);
+		Log("  SetLighting(100,100,100) -> %s *** LOOK AT WHEEL ***", led ? "OK" : "FAIL");
+
+		Sleep(1000);
+
+		// Try just green (RPM LEDs are green at low RPM)
+		led = g_LedSetLighting(0, 100, 0);
+		Log("  SetLighting(0,100,0) -> %s", led ? "OK" : "FAIL");
+
+		Sleep(1000);
+
+		// Try red (RPM LEDs are red at high RPM)
+		led = g_LedSetLighting(100, 0, 0);
+		Log("  SetLighting(100,0,0) -> %s", led ? "OK" : "FAIL");
+
+		Sleep(1000);
+
+		// Try monochrome target specifically
+		if (g_LedSetTarget)
+		{
+			g_LedSetTarget(0x01);  // MONOCHROME only
+			led = g_LedSetLighting(100, 100, 100);
+			Log("  SetTargetDevice(MONO) + SetLighting(100,100,100) -> %s", led ? "OK" : "FAIL");
+			Sleep(1000);
+		}
+
+		// Check if there's a zone-based function
+		FARPROC pZone = GetProcAddress(m_sdkDll, "LogiLedSetLightingForTargetZone");
+		if (pZone)
+		{
+			typedef bool (*SetZone_t)(int, int, int, int, int);
+			SetZone_t setZone = (SetZone_t)pZone;
+
+			// deviceType=ALL, zone=0..4, R=100, G=100, B=100
+			for (int zone = 0; zone < 6; zone++)
+			{
+				bool zled = setZone(0x07, zone, 100, 100, 100);
+				Log("  SetLightingForTargetZone(ALL,%d,100,100,100) -> %s", zone, zled ? "OK" : "FAIL");
+				Sleep(500);
+			}
+		}
+	}
+
+	Log("  SDK init complete - check if any LEDs responded");
+
+	m_method = METHOD_SDK;
+	m_available = true;
+	return true;
+}
+
+// --- I/O helpers ---
 
 bool LogitechLED::SendReport(HANDLE h, const BYTE* report, USHORT len)
 {
@@ -129,7 +309,7 @@ bool LogitechLED::ReadReport(HANDLE h, BYTE* report, USHORT len, DWORD timeoutMs
 	return ok && bytesRead > 0;
 }
 
-// --- Enumerate writable HID collections ---
+// --- Enumerate HID collections ---
 
 void LogitechLED::EnumerateCandidates(HIDCandidate* out, int* count)
 {
@@ -199,374 +379,66 @@ void LogitechLED::EnumerateCandidates(HIDCandidate* out, int* count)
 	SetupDiDestroyDeviceInfoList(devInfo);
 }
 
-// --- HID++ 2.0 Feature Discovery ---
+// --- HID++ 2.0 Discovery (Phase 1) ---
 
 bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 {
 	BYTE reportId = (outLen <= 20) ? 0x11 : 0x12;
-	Log("  HID++ probe: reportId=0x%02X", reportId);
-
-	BYTE devIdx = 0xFF;  // USB direct
-
-	// Query IRoot for IFeatureSet (0x0001)
+	BYTE devIdx = 0xFF;
 	BYTE req[64] = {0};
-	req[0] = reportId;
-	req[1] = devIdx;
-	req[2] = 0x00;              // IRoot at index 0
-	req[3] = (0 << 4) | 0x01;  // function 0, swId 1
-	req[4] = 0x00;
-	req[5] = 0x01;              // feature ID 0x0001
-
-	if (!SendReport(h, req, outLen)) { Log("  Send failed"); return false; }
-
 	BYTE resp[64] = {0};
-	if (!ReadReport(h, resp, inLen, 2000)) { Log("  No response"); return false; }
 
-	Log("  RX: %02X %02X %02X %02X | %02X %02X %02X %02X",
-		resp[0], resp[1], resp[2], resp[3], resp[4], resp[5], resp[6], resp[7]);
+	// Query IRoot for IFeatureSet
+	req[0] = reportId; req[1] = devIdx; req[2] = 0x00;
+	req[3] = 0x01; req[4] = 0x00; req[5] = 0x01;
 
-	if (resp[2] == 0xFF) { Log("  HID++ error: 0x%02X", resp[5]); return false; }
+	if (!SendReport(h, req, outLen)) return false;
+	if (!ReadReport(h, resp, inLen, 2000)) return false;
+	if (resp[2] == 0xFF || resp[4] == 0) return false;
 
 	BYTE ifsIdx = resp[4];
-	if (ifsIdx == 0) { Log("  IFeatureSet not found"); return false; }
+	Log("  HID++ 2.0: IFeatureSet at index %d", ifsIdx);
 
-	Log("  IFeatureSet at index %d - HID++ 2.0 confirmed!", ifsIdx);
-
-	// Get feature count
+	// Get count
 	memset(req, 0, sizeof(req));
 	req[0] = reportId; req[1] = devIdx; req[2] = ifsIdx;
-	req[3] = (0 << 4) | 0x01;
+	req[3] = 0x01;
 	if (!SendReport(h, req, outLen)) return false;
 	memset(resp, 0, sizeof(resp));
 	if (!ReadReport(h, resp, inLen, 2000)) return false;
 
-	int featureCount = resp[4];
-	Log("  Device has %d features:", featureCount);
+	int count = resp[4];
+	Log("  %d features (enumeration only)", count);
 
-	// Enumerate ALL features
-	BYTE enableIdx = 0;   // 0x1E00 EnableHiddenFeatures
-	BYTE feat807AIdx = 0; // 0x807A (suspected LED)
-
-	for (int fi = 1; fi <= featureCount && fi < 128; fi++)
+	for (int fi = 1; fi <= count && fi < 128; fi++)
 	{
 		memset(req, 0, sizeof(req));
 		req[0] = reportId; req[1] = devIdx; req[2] = ifsIdx;
-		req[3] = (1 << 4) | 0x01;
-		req[4] = (BYTE)fi;
-
+		req[3] = (1 << 4) | 0x01; req[4] = (BYTE)fi;
 		if (!SendReport(h, req, outLen)) continue;
 		memset(resp, 0, sizeof(resp));
 		if (!ReadReport(h, resp, inLen, 500)) continue;
-
 		USHORT fid = ((USHORT)resp[4] << 8) | resp[5];
-
-		const char* name = "";
-		switch (fid)
-		{
-			case 0x0001: name = " (IFeatureSet)"; break;
-			case 0x0003: name = " (DeviceInfo)"; break;
-			case 0x0005: name = " (DeviceName)"; break;
-			case 0x00C1: name = " (DfuControlUnsigned)"; break;
-			case 0x1800: name = " (GenericTest)"; break;
-			case 0x1802: name = " (DeviceReset)"; break;
-			case 0x1BC0: name = " (ReportHIDUsage)"; break;
-			case 0x1E00: name = " (EnableHiddenFeatures)"; break;
-			case 0x1F1F: name = " (FirmwareProperties)"; break;
-			case 0x8120: name = " (GamingAttachments)"; break;
-			case 0x8123: name = " (ForceFeedback)"; break;
-			case 0x8127: name = " (ForceFeedbackG923)"; break;
-			case 0x807A: name = " *** SUSPECTED LED ***"; break;
-		}
-
-		Log("    [%02d] 0x%04X type=0x%02X%s", fi, fid, resp[6], name);
-
-		if (fid == 0x1E00) enableIdx = (BYTE)fi;
-		if (fid == 0x807A) feat807AIdx = (BYTE)fi;
+		Log("    [%02d] 0x%04X", fi, fid);
 	}
 
-	// --- Step 1: Enable hidden features ---
-	if (enableIdx > 0)
-	{
-		Log("");
-		Log("  === Enabling hidden features (0x1E00 at idx %d) ===", enableIdx);
-
-		// func0 = getEnableHiddenFeatures
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = enableIdx;
-		req[3] = (0 << 4) | 0x01;
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-				Log("  getEnable: %02X %02X", resp[4], resp[5]);
-		}
-
-		// func1 = setEnableHiddenFeatures(0x01) - enable
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = enableIdx;
-		req[3] = (1 << 4) | 0x01;
-		req[4] = 0x01;  // enable
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-			{
-				if (resp[2] == 0xFF)
-					Log("  setEnable(1): ERR 0x%02X", resp[5]);
-				else
-					Log("  setEnable(1): OK %02X %02X", resp[4], resp[5]);
-			}
-		}
-
-		// func1 with 0xFF (max enable)
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = enableIdx;
-		req[3] = (1 << 4) | 0x01;
-		req[4] = 0xFF;
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-			{
-				if (resp[2] == 0xFF)
-					Log("  setEnable(0xFF): ERR 0x%02X", resp[5]);
-				else
-					Log("  setEnable(0xFF): OK %02X %02X", resp[4], resp[5]);
-			}
-		}
-
-		// Re-enumerate to see if new features appeared
-		Log("");
-		Log("  Re-enumerating features...");
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = ifsIdx;
-		req[3] = (0 << 4) | 0x01;
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-			{
-				int newCount = resp[4];
-				Log("  Feature count after enable: %d (was %d)", newCount, featureCount);
-
-				if (newCount > featureCount)
-				{
-					for (int fi = featureCount + 1; fi <= newCount && fi < 128; fi++)
-					{
-						memset(req, 0, sizeof(req));
-						req[0] = reportId; req[1] = devIdx; req[2] = ifsIdx;
-						req[3] = (1 << 4) | 0x01;
-						req[4] = (BYTE)fi;
-						if (!SendReport(h, req, outLen)) continue;
-						memset(resp, 0, sizeof(resp));
-						if (!ReadReport(h, resp, inLen, 500)) continue;
-						USHORT fid = ((USHORT)resp[4] << 8) | resp[5];
-						Log("    NEW [%02d] 0x%04X type=0x%02X", fi, fid, resp[6]);
-						if (fid == 0x807A) feat807AIdx = (BYTE)fi;
-					}
-				}
-			}
-		}
-	}
-
-	// --- Step 2: Probe 0x807A ---
-	if (feat807AIdx > 0)
-	{
-		Log("");
-		Log("  === Probing 0x807A at index %d ===", feat807AIdx);
-
-		// func0 getInfo
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = feat807AIdx;
-		req[3] = (0 << 4) | 0x01;
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-				Log("  func0: %02X %02X %02X %02X", resp[4], resp[5], resp[6], resp[7]);
-		}
-
-		// Read current state
-		memset(req, 0, sizeof(req));
-		req[0] = reportId; req[1] = devIdx; req[2] = feat807AIdx;
-		req[3] = (1 << 4) | 0x01;
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-				Log("  func1 state: %02X %02X %02X %02X", resp[4], resp[5], resp[6], resp[7]);
-		}
-
-		// Try func2 with targeted params, then check state after each
-		Log("");
-		Log("  === func2 attempts + state check (WATCH WHEEL!) ===");
-
-		struct { BYTE p[8]; const char* desc; } tries[] = {
-			{{0x1F,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, "mask=0x1F"},
-			{{0x01,0x01,0x01,0x01,0x01,0x00,0x00,0x00}, "5x 0x01"},
-			{{0x01,0x02,0x03,0x04,0x05,0x00,0x00,0x00}, "1,2,3,4,5"},
-			{{0x05,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x00}, "n=5,5xFF"},
-			{{0x00,0x05,0x1F,0x00,0x00,0x00,0x00,0x00}, "0,5,mask"},
-			{{0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, "mode=1"},
-		};
-
-		for (int t = 0; t < 6; t++)
-		{
-			memset(req, 0, sizeof(req));
-			req[0] = reportId; req[1] = devIdx; req[2] = feat807AIdx;
-			req[3] = (2 << 4) | 0x01;
-			memcpy(&req[4], tries[t].p, 8);
-
-			bool ok = SendReport(h, req, outLen);
-			BYTE r[64] = {0};
-			bool got = ok ? ReadReport(h, r, inLen, 300) : false;
-
-			// Now read state
-			memset(req, 0, sizeof(req));
-			req[0] = reportId; req[1] = devIdx; req[2] = feat807AIdx;
-			req[3] = (1 << 4) | 0x01;
-			SendReport(h, req, outLen);
-			BYTE st[64] = {0};
-			ReadReport(h, st, inLen, 300);
-
-			Log("  func2(%-12s) -> state: %02X %02X %02X %02X",
-				tries[t].desc, st[4], st[5], st[6], st[7]);
-
-			Sleep(500);
-		}
-	}
-
-	// --- Step 3: Try sending LED command via col0 (report 0x11) ---
-	// Discovery works on col1 (0x12), but LEDs might be wired to col0 (0x11)
-	if (feat807AIdx > 0)
-	{
-		Log("");
-		Log("  === Trying 0x807A commands via col0 (report 0x11) ===");
-
-		// Find col0 path (UP=0xFF43, Out=20)
-		// We need to open it separately - caller passes the col1 handle
-		// So we search candidates again for the 20-byte collection
-		HIDCandidate col0cands[MAX_CANDIDATES];
-		int col0count = 0;
-		EnumerateCandidates(col0cands, &col0count);
-
-		for (int ci = 0; ci < col0count; ci++)
-		{
-			if (col0cands[ci].usagePage != 0xFF43) continue;
-			if (col0cands[ci].outputReportLen != 20) continue;
-
-			HANDLE h0 = CreateFileA(col0cands[ci].path,
-				GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-				NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-			if (h0 == INVALID_HANDLE_VALUE)
-			{
-				Log("  Cannot open col0 (err=%lu)", GetLastError());
-				continue;
-			}
-
-			Log("  col0 opened (Out=20)");
-
-			// Try HID++ commands on col0 using feature index from col1
-			BYTE cmd0x11[20] = {0};
-
-			// func2 with bitmask via 0x11
-			cmd0x11[0] = 0x11;
-			cmd0x11[1] = devIdx;
-			cmd0x11[2] = feat807AIdx;
-			cmd0x11[3] = (2 << 4) | 0x01;
-			cmd0x11[4] = 0x1F;
-
-			bool ok = SendReport(h0, cmd0x11, 20);
-			Log("  col0 func2(0x1F): %s", ok ? "OK" : "FAIL");
-
-			// Try reading response from col0
-			BYTE r0[20] = {0};
-			if (ok && ReadReport(h0, r0, 20, 500))
-				Log("  col0 resp: %02X %02X %02X %02X %02X %02X",
-					r0[0], r0[1], r0[2], r0[3], r0[4], r0[5]);
-			else
-				Log("  col0 no response");
-
-			Sleep(500);
-
-			// Try func1 on col0
-			memset(cmd0x11, 0, sizeof(cmd0x11));
-			cmd0x11[0] = 0x11;
-			cmd0x11[1] = devIdx;
-			cmd0x11[2] = feat807AIdx;
-			cmd0x11[3] = (1 << 4) | 0x01;
-			cmd0x11[4] = 0x1F;
-
-			ok = SendReport(h0, cmd0x11, 20);
-			Log("  col0 func1(0x1F): %s", ok ? "OK" : "FAIL");
-
-			memset(r0, 0, sizeof(r0));
-			if (ok && ReadReport(h0, r0, 20, 500))
-				Log("  col0 resp: %02X %02X %02X %02X %02X %02X",
-					r0[0], r0[1], r0[2], r0[3], r0[4], r0[5]);
-
-			Sleep(500);
-
-			// Also try legacy [F8 12] on col0 AFTER enabling hidden features
-			BYTE leg[20] = {0};
-			leg[0] = 0x11;
-			leg[1] = 0xF8;
-			leg[2] = 0x12;
-			leg[3] = 0x1F;
-
-			ok = SendReport(h0, leg, 20);
-			Log("  col0 legacy [F8 12 1F]: %s", ok ? "OK" : "FAIL");
-
-			Sleep(500);
-
-			// Try legacy with extra byte at [7] = 0x01 (some implementations)
-			memset(leg, 0, sizeof(leg));
-			leg[0] = 0x11;
-			leg[1] = 0xF8;
-			leg[2] = 0x12;
-			leg[3] = 0x1F;
-			leg[7] = 0x01;
-
-			ok = SendReport(h0, leg, 20);
-			Log("  col0 legacy [F8 12 1F .. 01]: %s", ok ? "OK" : "FAIL");
-
-			CloseHandle(h0);
-			break;
-		}
-	}
-
-	// Save whatever we found for runtime attempts
-	if (feat807AIdx > 0)
-	{
-		m_ledFeatureIdx = feat807AIdx;
-		m_ledFunctionId = 2;
-		m_deviceIdx = devIdx;
-		Log("");
-		Log("  Feature 0x807A saved at index %d", feat807AIdx);
-		return true;
-	}
-
-	return false;
+	return false;  // Don't activate - kernel drivers block HID commands
 }
 
-// --- Legacy [F8 12] command (G29/G920/G923-PS) ---
+// --- Legacy (Phase 2) ---
 
 bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 {
 	BYTE reportId = (outLen <= 20) ? 0x11 : 0x12;
-
 	BYTE rpt[64] = {0};
-	rpt[0] = reportId;
-	rpt[1] = 0xF8;
-	rpt[2] = 0x12;
-	rpt[3] = 0x1F;
+	rpt[0] = reportId; rpt[1] = 0xF8; rpt[2] = 0x12; rpt[3] = 0x1F;
 
 	DWORD written = 0;
 	BOOL ok = WriteFile(h, rpt, outLen, &written, NULL);
 	bool success = ok && written > 0;
 
 	Log("  Legacy [%02X F8 12 1F] -> %s", reportId, success ? "OK" : "FAIL");
-	if (!success) { Log("    err=%lu", GetLastError()); return false; }
+	if (!success) return false;
 
 	Sleep(500);
 	rpt[3] = 0x00;
@@ -580,70 +452,45 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init (HID++ Discovery v3) ===");
+	Log("=== LogitechLED Init v4 ===");
 	Log("");
 
 	if (m_available) return true;
 
+	// Phase 0: G Hub LED SDK (preferred - works with kernel drivers)
+	if (TrySDK())
+		return true;
+
+	// Phase 1: HID++ enumeration (diagnostic only - kernel drivers block)
+	Log("");
+	Log("=== Phase 1: HID++ enumeration ===");
+
 	HIDCandidate candidates[MAX_CANDIDATES];
 	int numCandidates = 0;
 	EnumerateCandidates(candidates, &numCandidates);
+	Log("  %d writable collections", numCandidates);
 
-	Log("");
-	Log("Found %d writable collection(s)", numCandidates);
-
-	// Phase 1: HID++ discovery on 64-byte collection (col1, report 0x12)
 	for (int ci = 0; ci < numCandidates; ci++)
 	{
 		if (candidates[ci].usagePage != 0xFF43) continue;
 		if (candidates[ci].inputReportLen == 0) continue;
-		if (candidates[ci].outputReportLen < 64) continue;  // Only col1
-
-		Log("");
-		Log("=== HID++ Discovery on col%d (Out=%u In=%u) ===",
-			ci, candidates[ci].outputReportLen, candidates[ci].inputReportLen);
+		if (candidates[ci].outputReportLen < 64) continue;
 
 		HANDLE h = CreateFileA(candidates[ci].path,
 			GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-		if (h == INVALID_HANDLE_VALUE) { Log("  Open failed"); continue; }
+		if (h == INVALID_HANDLE_VALUE) continue;
 
-		bool found = TryHIDPPDiscovery(h,
-			candidates[ci].outputReportLen, candidates[ci].inputReportLen);
-
+		TryHIDPPDiscovery(h, candidates[ci].outputReportLen, candidates[ci].inputReportLen);
 		CloseHandle(h);
-
-		if (found)
-		{
-			// Reopen for runtime
-			m_handle = CreateFileA(candidates[ci].path,
-				GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-				NULL, OPEN_EXISTING, 0, NULL);
-
-			if (m_handle == INVALID_HANDLE_VALUE) continue;
-
-			m_reportLen = candidates[ci].outputReportLen;
-			m_method = METHOD_HIDPP;
-			m_available = true;
-
-			Log("");
-			Log("=== LED CONTROL ACTIVE (HID++) ===");
-			SetLEDs(0x1F);
-			Sleep(1000);
-			ClearLEDs();
-			return true;
-		}
 	}
 
-	// Phase 2: Legacy on all collections
+	// Phase 2: Legacy fallback
 	Log("");
-	Log("=== Trying legacy LED commands ===");
+	Log("=== Phase 2: Legacy ===");
 
 	for (int ci = 0; ci < numCandidates; ci++)
 	{
-		Log("--- col%d: UP=0x%04X OutLen=%u ---",
-			ci, candidates[ci].usagePage, candidates[ci].outputReportLen);
-
 		HANDLE h = CreateFileA(candidates[ci].path,
 			GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, 0, NULL);
@@ -657,12 +504,11 @@ bool LogitechLED::Init()
 			Log("=== LED CONTROL ACTIVE (legacy) ===");
 			return true;
 		}
-
 		CloseHandle(h);
 	}
 
 	Log("");
-	Log("=== NO WORKING METHOD FOUND ===");
+	Log("=== NO WORKING METHOD ===");
 	return false;
 }
 
@@ -672,8 +518,27 @@ static int g_setLedsCallCount = 0;
 
 bool LogitechLED::SetLEDs(BYTE ledMask)
 {
-	if (!m_available || m_handle == INVALID_HANDLE_VALUE)
-		return false;
+	if (!m_available) return false;
+
+	if (m_method == METHOD_SDK && g_LedSetLighting)
+	{
+		// Map 5-bit LED mask to brightness percentage
+		int numLeds = 0;
+		for (int i = 0; i < 5; i++)
+			if (ledMask & (1 << i)) numLeds++;
+
+		int pct = numLeds * 20;  // 0-100%
+		bool ok = g_LedSetLighting(pct, pct, pct);
+
+		g_setLedsCallCount++;
+		if (g_setLedsCallCount <= 20 || !ok)
+			Log("SetLEDs(0x%02X) [SDK pct=%d] -> %s (#%d)",
+				ledMask, pct, ok ? "OK" : "FAIL", g_setLedsCallCount);
+
+		return ok;
+	}
+
+	if (m_handle == INVALID_HANDLE_VALUE) return false;
 
 	BYTE rpt[64] = {0};
 	BYTE reportId = (m_reportLen <= 20) ? 0x11 : 0x12;
@@ -706,7 +571,6 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 			m_method == METHOD_HIDPP ? "HID++" : "legacy",
 			success ? "OK" : "FAIL",
 			g_setLedsCallCount);
-		if (!success) Log("  err=%lu", GetLastError());
 	}
 
 	return success;
