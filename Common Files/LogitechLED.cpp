@@ -421,47 +421,184 @@ bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 			}
 		}
 
-		// --- Try LED commands on each unknown 0x8xxx feature ---
+		// --- Quick probe on other unknown features ---
 		Log("");
-		Log("  === LED attempts on unknown features (WATCH THE WHEEL!) ===");
+		Log("  === Quick probe on unknown features ===");
 
 		for (int pi = 0; pi < numProbe; pi++)
 		{
-			Log("");
-			Log("  --- Feature 0x%04X at index %d ---", probeFid[pi], probeIdx[pi]);
+			// Skip 0x807A - we'll deep-probe it below
+			if (probeFid[pi] == 0x807A) continue;
 
-			// Try func1-3 with LED bitmask 0x1F (all 5 LEDs)
-			for (BYTE funcId = 1; funcId <= 3; funcId++)
+			for (BYTE funcId = 1; funcId <= 2; funcId++)
 			{
 				memset(req, 0, sizeof(req));
 				req[0] = reportId;
 				req[1] = devIdx;
 				req[2] = probeIdx[pi];
 				req[3] = (funcId << 4) | 0x01;
-				req[4] = 0x1F;  // all LEDs on
+				req[4] = 0x1F;
 
 				bool ok = SendReport(h, req, outLen);
 				BYTE tryResp[64] = {0};
 				bool gotResp = ok ? ReadReport(h, tryResp, inLen, 300) : false;
 
 				if (!ok)
-					Log("    func%d(0x1F): SEND FAIL", funcId);
+					Log("  0x%04X func%d(0x1F): SEND FAIL", probeFid[pi], funcId);
 				else if (gotResp && tryResp[2] == 0xFF)
-					Log("    func%d(0x1F): ERR 0x%02X", funcId, tryResp[5]);
+					Log("  0x%04X func%d(0x1F): ERR 0x%02X", probeFid[pi], funcId, tryResp[5]);
 				else if (gotResp)
-					Log("    func%d(0x1F): OK resp=%02X %02X %02X %02X",
-						funcId, tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
+					Log("  0x%04X func%d(0x1F): OK resp=%02X %02X %02X %02X",
+						probeFid[pi], funcId,
+						tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
 				else
-					Log("    func%d(0x1F): OK (no resp)", funcId);
+					Log("  0x%04X func%d(0x1F): OK (no resp)", probeFid[pi], funcId);
 
-				Sleep(400);
+				Sleep(300);
 			}
 		}
 
-		// Save best guess
+		// --- Deep probe 0x807A (likely LED feature: func0 returned 03 05 02) ---
+		// Find 0x807A index
+		BYTE ledIdx807A = 0;
+		for (int pi = 0; pi < numProbe; pi++)
+		{
+			if (probeFid[pi] == 0x807A) { ledIdx807A = probeIdx[pi]; break; }
+		}
+
+		if (ledIdx807A > 0)
+		{
+			Log("");
+			Log("  === DEEP PROBE 0x807A at index %d (WATCH THE WHEEL!) ===", ledIdx807A);
+			Log("  func0 said: 03=funcs 05=LEDs 02=caps");
+			Log("");
+
+			// First read current state with func1 (no params)
+			memset(req, 0, sizeof(req));
+			req[0] = reportId;
+			req[1] = devIdx;
+			req[2] = ledIdx807A;
+			req[3] = (1 << 4) | 0x01;  // func1 = getLedState?
+			// No params - see what the current state is
+
+			if (SendReport(h, req, outLen))
+			{
+				memset(resp, 0, sizeof(resp));
+				if (ReadReport(h, resp, inLen, 500))
+					Log("  func1() get state: %02X %02X %02X %02X %02X %02X",
+						resp[4], resp[5], resp[6], resp[7], resp[8], resp[9]);
+			}
+
+			// Try many param formats on func2 (setLedState?)
+			struct { BYTE p[16]; int plen; const char* desc; } tries[] = {
+				// Bitmask encodings
+				{{0x1F},                          1, "mask=0x1F"},
+				{{0xFF},                          1, "0xFF"},
+				{{0x01},                          1, "0x01"},
+				// Per-LED state (5 LEDs, each on)
+				{{0x01,0x01,0x01,0x01,0x01},      5, "5x 0x01"},
+				{{0xFF,0xFF,0xFF,0xFF,0xFF},      5, "5x 0xFF"},
+				// Zone + mask
+				{{0x00,0x1F},                     2, "zone0,mask=0x1F"},
+				{{0x01,0x1F},                     2, "zone1,mask=0x1F"},
+				{{0x00,0xFF},                     2, "zone0,0xFF"},
+				// LED index + state
+				{{0x00,0x01},                     2, "led0,on"},
+				{{0x00,0xFF},                     2, "led0,0xFF"},
+				{{0x04,0x01},                     2, "led4,on"},
+				// RPM percentage values
+				{{0x64},                          1, "100(pct)"},
+				{{0xC8},                          1, "200"},
+				// With brightness
+				{{0x1F,0xFF},                     2, "mask=0x1F,bright=0xFF"},
+				{{0x1F,0x64},                     2, "mask=0x1F,bright=100"},
+				// Byte-per-LED with brightness
+				{{0x00,0x01,0xFF},                3, "led0,on,0xFF"},
+				{{0x00,0x00,0xFF,0x00,0x00},      5, "G=0,R=FF"},
+				// Count + states
+				{{0x05,0x01,0x01,0x01,0x01,0x01}, 6, "n=5,all on"},
+				// Enable/mode then mask
+				{{0x01,0x00,0x1F},                3, "enable,0,mask"},
+				{{0x02,0x1F},                     2, "mode2,mask"},
+			};
+			int numTries = sizeof(tries) / sizeof(tries[0]);
+
+			for (int t = 0; t < numTries; t++)
+			{
+				memset(req, 0, sizeof(req));
+				req[0] = reportId;
+				req[1] = devIdx;
+				req[2] = ledIdx807A;
+				req[3] = (2 << 4) | 0x01;  // func2 = setLedState
+				memcpy(&req[4], tries[t].p, tries[t].plen);
+
+				bool ok = SendReport(h, req, outLen);
+				BYTE tryResp[64] = {0};
+				bool gotResp = ok ? ReadReport(h, tryResp, inLen, 300) : false;
+
+				if (!ok)
+					Log("  [%02d] func2(%-20s): SEND FAIL", t, tries[t].desc);
+				else if (gotResp && tryResp[2] == 0xFF)
+					Log("  [%02d] func2(%-20s): ERR 0x%02X", t, tries[t].desc, tryResp[5]);
+				else if (gotResp)
+					Log("  [%02d] func2(%-20s): OK r=%02X %02X %02X %02X",
+						t, tries[t].desc,
+						tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
+				else
+					Log("  [%02d] func2(%-20s): OK (no r)", t, tries[t].desc);
+
+				Sleep(500);
+			}
+
+			// Also try func1 as setter with same key formats
+			Log("");
+			Log("  --- func1 as setter ---");
+			BYTE func1Tries[][8] = {
+				{0x00,0x1F,0,0,0,0,0,0},
+				{0x01,0x1F,0,0,0,0,0,0},
+				{0x01,0x01,0x01,0x01,0x01,0,0,0},
+				{0xFF,0xFF,0xFF,0xFF,0xFF,0,0,0},
+				{0x05,0x01,0x01,0x01,0x01,0x01,0,0},
+			};
+			const char* func1Desc[] = {
+				"zone0,mask=0x1F", "zone1,mask=0x1F",
+				"5x 0x01", "5x 0xFF", "n=5,all on"
+			};
+
+			for (int t = 0; t < 5; t++)
+			{
+				memset(req, 0, sizeof(req));
+				req[0] = reportId;
+				req[1] = devIdx;
+				req[2] = ledIdx807A;
+				req[3] = (1 << 4) | 0x01;
+				memcpy(&req[4], func1Tries[t], 8);
+
+				bool ok = SendReport(h, req, outLen);
+				BYTE tryResp[64] = {0};
+				bool gotResp = ok ? ReadReport(h, tryResp, inLen, 300) : false;
+
+				if (gotResp && tryResp[2] == 0xFF)
+					Log("  func1(%-20s): ERR 0x%02X", func1Desc[t], tryResp[5]);
+				else if (gotResp)
+					Log("  func1(%-20s): OK r=%02X %02X %02X %02X",
+						func1Desc[t],
+						tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
+				else
+					Log("  func1(%-20s): %s", func1Desc[t], ok ? "OK (no r)" : "FAIL");
+
+				Sleep(500);
+			}
+
+			// Save 0x807A as the LED feature
+			bestLedIdx = ledIdx807A;
+			bestLedFid = 0x807A;
+		}
+
+		// Save config
 		m_method = METHOD_HIDPP;
 		m_ledFeatureIdx = bestLedIdx;
-		m_ledFunctionId = 1;
+		m_ledFunctionId = 2;  // func2 = setter for 0x807A
 		m_deviceIdx = devIdx;
 		Log("");
 		Log("  HID++ saved: feat=0x%04X idx=%d func=%d devIdx=0x%02X",
