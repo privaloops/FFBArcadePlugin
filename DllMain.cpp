@@ -29,6 +29,7 @@ along with FFB Arcade Plugin.If not, see < https://www.gnu.org/licenses/>.
 #include <atlcomcli.h>
 #include <TlHelp32.h>
 #include "Config/PersistentValues.h"
+#include "Common Files/LogitechLED.h"
 
 // include all game header files here.
 #include "Game Files/TestGame.h"
@@ -891,6 +892,7 @@ SDL_Haptic* haptic3 = NULL;
 EffectCollection effects;
 EffectConstants effectConst;
 Helpers hlp;
+LogitechLED g923LED;
 EffectTriggers t;
 
 bool CustomStrength = false;
@@ -977,6 +979,7 @@ int ResetFFBStrength = GetPrivateProfileInt(TEXT("Settings"), TEXT("ResetFFBStre
 int StepFFBStrength = GetPrivateProfileInt(TEXT("Settings"), TEXT("StepFFBStrength"), 5, settingsFilename);
 int EnableFFBStrengthPersistence = GetPrivateProfileInt(TEXT("Settings"), TEXT("EnableFFBStrengthPersistence"), 0, settingsFilename);
 int EnableFFBStrengthTextToSpeech = GetPrivateProfileInt(TEXT("Settings"), TEXT("EnableFFBStrengthTextToSpeech"), 0, settingsFilename);
+int EnableLogitechLED = GetPrivateProfileInt(TEXT("Settings"), TEXT("EnableLogitechLED"), 0, settingsFilename);
 int InputDeviceWheelEnable = GetPrivateProfileInt(TEXT("Settings"), TEXT("InputDeviceWheelEnable"), 0, settingsFilename);
 int IgnoreFirstMatchingGUID = GetPrivateProfileInt(TEXT("Settings"), TEXT("IgnoreFirstMatchingGUID"), 0, settingsFilename);
 int DoubleSine = GetPrivateProfileInt(TEXT("Settings"), TEXT("DoubleSine"), 0, settingsFilename);
@@ -1320,6 +1323,19 @@ void Initialize(int device_index)
 //	extern bool hackFix;
 //	hackFix = true;
 
+	// Initialize Logitech G923/G29 RPM LEDs
+	if (EnableLogitechLED)
+	{
+		if (g923LED.Init())
+		{
+			hlp.log("Logitech RPM LEDs initialized");
+			g923LED.ClearLEDs();
+		}
+		else
+		{
+			hlp.log("Logitech RPM LEDs not found (EnableLogitechLED is on but no compatible device detected)");
+		}
+	}
 }
 
 using namespace std::chrono;
@@ -1387,6 +1403,12 @@ void TriggerConstantEffect(int direction, double strength)
 
 	SDL_HapticUpdateEffect(haptic, effects.effect_constant_id, &tempEffect);
 	SDL_HapticRunEffect(haptic, effects.effect_constant_id, 1);
+
+	// Update Logitech RPM LEDs based on FFB intensity
+	if (EnableLogitechLED && g923LED.IsAvailable())
+	{
+		g923LED.SetLEDsFromPercent(strength);
+	}
 }
 
 void TriggerFrictionEffectWithDefaultOption(double strength, bool isDefault)
