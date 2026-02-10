@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         configuration: [Release]
-        platform: [Win32, x64]
+        platform: [x86, x64]
 
     steps:
       - uses: actions/checkout@v4
@@ -44,5 +44,5 @@ jobs:
         with:
           name: FFBArcadePlugin-${{ matrix.configuration }}-${{ matrix.platform }}
           path: |
-            ${{ matrix.configuration }}.${{ matrix.platform }}/*.dll
-            ${{ matrix.configuration }}.${{ matrix.platform }}/*.ini
+            ${{ matrix.configuration }}.${{ matrix.platform == 'x86' && 'Win32' || matrix.platform }}/*.dll
+            ${{ matrix.configuration }}.${{ matrix.platform == 'x86' && 'Win32' || matrix.platform }}/*.ini
