@@ -95,39 +95,88 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 	if (!report)
 		return false;
 
-	// First byte = Report ID (0x00 for default)
-	// Then the Logitech extended command
-	report[0] = 0x00;                        // Report ID
-	report[1] = LOGITECH_CMD_SET_LED;        // 0xF8
-	report[2] = LOGITECH_LED_SUBCMD;         // 0x12
-	report[3] = ledMask & 0x1F;              // 5 LEDs, bits 0-4
+	// For Logitech wheels, the extended command IS the report.
+	// The Report ID byte is implicit in the HID descriptor.
+	// Use HidD_SetOutputReport which handles report ID routing properly.
+	report[0] = LOGITECH_CMD_SET_LED;        // 0xF8 - this IS the report ID for extended commands
+	report[1] = LOGITECH_LED_SUBCMD;         // 0x12
+	report[2] = ledMask & 0x1F;              // 5 LEDs, bits 0-4
+	report[3] = 0x00;
 	report[4] = 0x00;
 	report[5] = 0x00;
 	report[6] = 0x00;
 	report[7] = 0x01;
 
-	DWORD bytesWritten = 0;
 	char buf[256];
-	sprintf_s(buf, "LogitechLED: SetLEDs mask=0x%02X reportLen=%u", ledMask, m_outputReportLength);
+	sprintf_s(buf, "LogitechLED: SetLEDs mask=0x%02X reportLen=%u report[0]=0x%02X",
+		ledMask, m_outputReportLength, report[0]);
 	LEDLog(buf);
 
-	BOOL result = WriteFile(m_deviceHandle, report, m_outputReportLength, &bytesWritten, NULL);
+	// Try HidD_SetOutputReport first (more reliable for HID devices with specific report IDs)
+	BOOL result = HidD_SetOutputReport(m_deviceHandle, report, m_outputReportLength);
 
 	if (!result)
 	{
 		DWORD err = GetLastError();
-		sprintf_s(buf, "LogitechLED: WriteFile FAILED, error=%lu", err);
+		sprintf_s(buf, "LogitechLED: HidD_SetOutputReport FAILED (reportID=0xF8), error=%lu", err);
 		LEDLog(buf);
 
-		if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_GEN_FAILURE)
+		// Fallback: try with report ID 0x00 (some devices expect this)
+		memset(report, 0, m_outputReportLength);
+		report[0] = 0x00;                        // Report ID 0
+		report[1] = LOGITECH_CMD_SET_LED;        // 0xF8
+		report[2] = LOGITECH_LED_SUBCMD;         // 0x12
+		report[3] = ledMask & 0x1F;
+		report[4] = 0x00;
+		report[5] = 0x00;
+		report[6] = 0x00;
+		report[7] = 0x01;
+
+		result = HidD_SetOutputReport(m_deviceHandle, report, m_outputReportLength);
+		if (!result)
 		{
-			Close();
+			err = GetLastError();
+			sprintf_s(buf, "LogitechLED: HidD_SetOutputReport FAILED (reportID=0x00), error=%lu", err);
+			LEDLog(buf);
+
+			// Last resort: try WriteFile with report ID = 0xF8
+			memset(report, 0, m_outputReportLength);
+			report[0] = LOGITECH_CMD_SET_LED;
+			report[1] = LOGITECH_LED_SUBCMD;
+			report[2] = ledMask & 0x1F;
+			report[3] = 0x00;
+			report[4] = 0x00;
+			report[5] = 0x00;
+			report[6] = 0x00;
+			report[7] = 0x01;
+
+			DWORD bytesWritten = 0;
+			result = WriteFile(m_deviceHandle, report, m_outputReportLength, &bytesWritten, NULL);
+			if (!result)
+			{
+				err = GetLastError();
+				sprintf_s(buf, "LogitechLED: WriteFile FAILED (reportID=0xF8), error=%lu", err);
+				LEDLog(buf);
+
+				if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_GEN_FAILURE)
+				{
+					Close();
+				}
+			}
+			else
+			{
+				sprintf_s(buf, "LogitechLED: WriteFile OK (reportID=0xF8), bytes=%lu", bytesWritten);
+				LEDLog(buf);
+			}
+		}
+		else
+		{
+			LEDLog("LogitechLED: HidD_SetOutputReport OK (reportID=0x00)");
 		}
 	}
 	else
 	{
-		sprintf_s(buf, "LogitechLED: WriteFile OK, bytesWritten=%lu", bytesWritten);
-		LEDLog(buf);
+		LEDLog("LogitechLED: HidD_SetOutputReport OK (reportID=0xF8)");
 	}
 
 	free(report);
@@ -176,12 +225,14 @@ bool LogitechLED::FindAndOpenDevice()
 
 	int deviceCount = 0;
 	int logitechCount = 0;
+	HANDLE bestHandle = INVALID_HANDLE_VALUE;
+	USHORT bestReportLen = 0;
+	char bestPath[512] = { 0 };
 
 	for (DWORD i = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL, &hidGuid, i, &interfaceData); i++)
 	{
 		deviceCount++;
 
-		// Get required buffer size
 		DWORD requiredSize = 0;
 		SetupDiGetDeviceInterfaceDetailA(deviceInfoSet, &interfaceData, NULL, 0, &requiredSize, NULL);
 
@@ -198,7 +249,6 @@ bool LogitechLED::FindAndOpenDevice()
 			continue;
 		}
 
-		// Open the device
 		HANDLE handle = CreateFileA(
 			detailData->DevicePath,
 			GENERIC_READ | GENERIC_WRITE,
@@ -233,28 +283,31 @@ bool LogitechLED::FindAndOpenDevice()
 						sprintf_s(buf,
 							"LogitechLED: Found Logitech VID=0x%04X PID=0x%04X "
 							"UsagePage=0x%04X Usage=0x%04X "
-							"InputReportLen=%u OutputReportLen=%u FeatureReportLen=%u "
+							"InLen=%u OutLen=%u FeatLen=%u "
+							"NumOutputValueCaps=%u "
 							"Path=%s",
 							attrs.VendorID, attrs.ProductID,
 							caps.UsagePage, caps.Usage,
 							caps.InputReportByteLength,
 							caps.OutputReportByteLength,
 							caps.FeatureReportByteLength,
+							caps.NumberOutputValueCaps,
 							detailData->DevicePath);
 						LEDLog(buf);
 
-						// We need an output report length that can hold our command
+						// Log ALL collections, pick the best one for output
 						if (caps.OutputReportByteLength >= 8)
 						{
-							m_outputReportLength = caps.OutputReportByteLength;
-							HidD_FreePreparsedData(preparsedData);
-							free(detailData);
-							SetupDiDestroyDeviceInfoList(deviceInfoSet);
-							m_deviceHandle = handle;
-
-							sprintf_s(buf, "LogitechLED: Using device with OutputReportLen=%u", m_outputReportLength);
-							LEDLog(buf);
-							return true;
+							// Prefer larger OutputReportByteLength (more likely the right interface)
+							if (bestHandle == INVALID_HANDLE_VALUE || caps.OutputReportByteLength > bestReportLen)
+							{
+								if (bestHandle != INVALID_HANDLE_VALUE)
+									CloseHandle(bestHandle);
+								bestHandle = handle;
+								bestReportLen = caps.OutputReportByteLength;
+								strcpy_s(bestPath, detailData->DevicePath);
+								handle = INVALID_HANDLE_VALUE; // don't close below
+							}
 						}
 					}
 					HidD_FreePreparsedData(preparsedData);
@@ -262,15 +315,27 @@ bool LogitechLED::FindAndOpenDevice()
 			}
 		}
 
-		CloseHandle(handle);
+		if (handle != INVALID_HANDLE_VALUE)
+			CloseHandle(handle);
 		free(detailData);
+	}
+
+	SetupDiDestroyDeviceInfoList(deviceInfoSet);
+
+	if (bestHandle != INVALID_HANDLE_VALUE)
+	{
+		m_deviceHandle = bestHandle;
+		m_outputReportLength = bestReportLen;
+		char buf[512];
+		sprintf_s(buf, "LogitechLED: Selected device OutputReportLen=%u Path=%s",
+			m_outputReportLength, bestPath);
+		LEDLog(buf);
+		return true;
 	}
 
 	char buf[128];
 	sprintf_s(buf, "LogitechLED: Enumerated %d HID devices, found %d Logitech matches, none suitable",
 		deviceCount, logitechCount);
 	LEDLog(buf);
-
-	SetupDiDestroyDeviceInfoList(deviceInfoSet);
 	return false;
 }
