@@ -35,6 +35,7 @@ public:
 private:
 	HANDLE m_deviceHandle;
 	bool m_available;
+	USHORT m_outputReportLength;
 
 	// Find the G923 HID device path and open it
 	bool FindAndOpenDevice();
