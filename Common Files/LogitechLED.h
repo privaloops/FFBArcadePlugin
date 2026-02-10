@@ -3,8 +3,8 @@
 #include <windows.h>
 
 // Logitech G923/G29 RPM LED controller via HID
-// G923 Xbox: HID++ protocol via WriteFile on vendor collection
-// G29/G923 PS: Legacy 0xF8 command
+// Uses a diagnostic probe at init to find the working LED method
+// by trying all collections and all command formats.
 
 class LogitechLED
 {
@@ -23,37 +23,21 @@ public:
 private:
 	static const int MAX_CANDIDATES = 8;
 
-	struct HIDPath
+	struct HIDCandidate
 	{
 		char path[512];
 		USHORT outputReportLen;
-		USHORT inputReportLen;
 		USHORT usagePage;
 	};
 
-	HANDLE m_writeHandle;     // Sync handle for WriteFile / HidD_SetOutputReport
-	HANDLE m_readHandle;      // Overlapped handle for ReadFile with timeout
+	// Working method (found during probe)
+	HANDLE m_handle;
 	bool m_available;
 	USHORT m_reportLen;
-	USHORT m_inputReportLen;
+	BYTE m_reportTemplate[64];  // The exact report bytes that worked
+	int m_templateLen;
 
-	// LED method (determined at init)
-	enum LEDMethod { METHOD_NONE, METHOD_LEGACY, METHOD_HIDPP };
-	LEDMethod m_method;
-	BYTE m_ledFeatureIndex;   // HID++ feature index for LED control
-
-	bool FindDevice(char* outPath, int pathSize, USHORT* outReportLen,
-	                USHORT* outInputLen, bool* outIsVendor);
-
-	// Legacy protocol
-	bool SetLEDsLegacy(BYTE ledMask);
-
-	// HID++ protocol via WriteFile
-	bool InitHIDPP();
-	bool SetLEDsHIDPP(BYTE ledMask);
-	bool HIDPPSendLong(BYTE deviceIdx, BYTE featureIdx, BYTE funcSwId,
-	                    const BYTE* params, int paramLen);
-	bool HIDPPRecv(BYTE* response, int responseLen, DWORD timeoutMs);
-	BYTE HIDPPDiscoverFeature(USHORT featureId);
-	void HIDPPEnumerateAllFeatures();
+	void EnumerateCandidates(HIDCandidate* out, int* count);
+	bool ProbeCandidate(const HIDCandidate& c, int candidateIdx);
+	bool SendReport(HANDLE h, const BYTE* report, USHORT len);
 };
