@@ -1342,7 +1342,7 @@ void TriggerConstantEffect(int direction, double strength)
 	tempEffect.type = SDL_HAPTIC_CONSTANT;
 	tempEffect.constant.direction.type = SDL_HAPTIC_CARTESIAN;
 	tempEffect.constant.direction.dir[0] = direction;
-	tempEffect.constant.length = configFeedbackLength;
+	tempEffect.constant.length = SDL_HAPTIC_INFINITY;
 	tempEffect.constant.delay = 0;
 
 	int confMinForce = configMinForce;
@@ -1435,7 +1435,7 @@ void TriggerInertiaEffect(double strength)
 	tempEffect.condition.type = SDL_HAPTIC_INERTIA;
 	tempEffect.condition.direction.type = SDL_HAPTIC_CARTESIAN;
 	tempEffect.condition.delay = 0;
-	tempEffect.condition.length = configFeedbackLength;
+	tempEffect.condition.length = SDL_HAPTIC_INFINITY;
 	tempEffect.condition.direction.dir[0] = 1;
 	tempEffect.condition.direction.dir[1] = 1; //Y Position
 	SHORT minForce = (SHORT)(strength > 0.001 ? (configMinForce / 100.0 * 32767.0) : 0); // strength is a double so we do an epsilon check of 0.001 instead of > 0.
@@ -1520,7 +1520,7 @@ void TriggerDamperEffect(double strength)
 	tempEffect.condition.type = SDL_HAPTIC_DAMPER;
 	tempEffect.condition.direction.type = SDL_HAPTIC_CARTESIAN;
 	tempEffect.condition.delay = 0;
-	tempEffect.condition.length = configFeedbackLength;
+	tempEffect.condition.length = SDL_HAPTIC_INFINITY;
 	tempEffect.condition.direction.dir[0] = 1; // not used
 	tempEffect.condition.direction.dir[1] = 0; //Y Position
 	SHORT minForce = (SHORT)(strength > 0.001 ? (configMinForce / 100.0 * 32767.0) : 0); // strength is a double so we do an epsilon check of 0.001 instead of > 0.
