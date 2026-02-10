@@ -308,7 +308,24 @@ bool LogitechLED::Init()
 		{
 			m_available = true;
 			Log("");
-			Log("=== LED CONTROL ACTIVE ===");
+			Log("=== LED CONTROL ACTIVE - SUSTAINED TEST ===");
+			Log("Turning ALL LEDs on for 2 seconds...");
+
+			// Sustained test: all LEDs on for 2s
+			SetLEDs(0x1F);
+			Sleep(2000);
+
+			// Then cycle each LED individually
+			for (int led = 0; led < 5; led++)
+			{
+				BYTE mask = (BYTE)(1 << led);
+				Log("  LED %d (mask=0x%02X)", led + 1, mask);
+				SetLEDs(mask);
+				Sleep(500);
+			}
+
+			ClearLEDs();
+			Log("LED test complete.");
 			return true;
 		}
 	}
@@ -321,6 +338,8 @@ bool LogitechLED::Init()
 
 // --- Runtime LED control ---
 
+static int g_setLedsCallCount = 0;
+
 bool LogitechLED::SetLEDs(BYTE ledMask)
 {
 	if (!m_available || m_handle == INVALID_HANDLE_VALUE)
@@ -332,7 +351,16 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 	rpt[2] = 0x12;
 	rpt[3] = ledMask & 0x1F;
 
-	return SendReport(m_handle, rpt, m_reportLen);
+	bool ok = SendReport(m_handle, rpt, m_reportLen);
+
+	g_setLedsCallCount++;
+	if (g_setLedsCallCount <= 20 || !ok)
+	{
+		Log("SetLEDs(0x%02X) -> %s (call #%d)", ledMask, ok ? "OK" : "FAIL", g_setLedsCallCount);
+		if (!ok) Log("  err=%lu", GetLastError());
+	}
+
+	return ok;
 }
 
 bool LogitechLED::SetLEDsFromPercent(double percent)
