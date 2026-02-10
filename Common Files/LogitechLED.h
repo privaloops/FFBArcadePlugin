@@ -1,10 +1,13 @@
 #pragma once
 
+#define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <dinput.h>
 
-// Logitech G923/G29 RPM LED controller via Logitech Steering Wheel SDK.
-// Requires Logitech G Hub to be running.
-// Uses dynamic loading: no hard dependency on the SDK DLL.
+// Logitech G923/G29 RPM LED controller via DirectInput Escape().
+// Uses the same mechanism as the Logitech SDK "Independent" sample.
+// Requires Logitech G Hub running (provides the FF driver that handles Escape).
+// No external DLL dependency.
 
 class LogitechLED
 {
@@ -21,19 +24,17 @@ public:
 	bool IsAvailable() const;
 
 private:
-	HMODULE m_sdkModule;
+	HMODULE m_dinputDll;
+	LPDIRECTINPUT8A m_pDI;
+	LPDIRECTINPUTDEVICE8A m_pDevice;
 	bool m_available;
 
-	// SDK function pointers
-	typedef bool (__cdecl *PFN_LogiSteeringInitialize)(bool);
-	typedef bool (__cdecl *PFN_LogiUpdate)();
-	typedef bool (__cdecl *PFN_LogiIsConnected)(int);
-	typedef bool (__cdecl *PFN_LogiPlayLeds)(int, float, float, float);
-	typedef void (__cdecl *PFN_LogiSteeringShutdown)();
+	struct EnumContext
+	{
+		GUID deviceGuid;
+		bool found;
+	};
 
-	PFN_LogiSteeringInitialize m_pfnInit;
-	PFN_LogiUpdate m_pfnUpdate;
-	PFN_LogiIsConnected m_pfnIsConnected;
-	PFN_LogiPlayLeds m_pfnPlayLeds;
-	PFN_LogiSteeringShutdown m_pfnShutdown;
+	bool PlayLedsEscape(float currentRPM, float rpmFirstLed, float rpmRedLine);
+	static BOOL CALLBACK EnumDevicesCallback(LPCDIDEVICEINSTANCEA lpddi, LPVOID pvRef);
 };
