@@ -2,9 +2,9 @@
 
 #include <windows.h>
 
-// Logitech G923/G29 RPM LED controller via HID
-// Uses a diagnostic probe at init to find the working LED method
-// by trying all collections and all command formats.
+// Logitech G923/G29 RPM LED controller via Logitech Steering Wheel SDK.
+// Requires Logitech G Hub to be running.
+// Uses dynamic loading: no hard dependency on the SDK DLL.
 
 class LogitechLED
 {
@@ -21,23 +21,19 @@ public:
 	bool IsAvailable() const;
 
 private:
-	static const int MAX_CANDIDATES = 8;
-
-	struct HIDCandidate
-	{
-		char path[512];
-		USHORT outputReportLen;
-		USHORT usagePage;
-	};
-
-	// Working method (found during probe)
-	HANDLE m_handle;
+	HMODULE m_sdkModule;
 	bool m_available;
-	USHORT m_reportLen;
-	BYTE m_reportTemplate[64];  // The exact report bytes that worked
-	int m_templateLen;
 
-	void EnumerateCandidates(HIDCandidate* out, int* count);
-	bool ProbeCandidate(const HIDCandidate& c, int candidateIdx);
-	bool SendReport(HANDLE h, const BYTE* report, USHORT len);
+	// SDK function pointers
+	typedef bool (__cdecl *PFN_LogiSteeringInitialize)(bool);
+	typedef bool (__cdecl *PFN_LogiUpdate)();
+	typedef bool (__cdecl *PFN_LogiIsConnected)(int);
+	typedef bool (__cdecl *PFN_LogiPlayLeds)(int, float, float, float);
+	typedef void (__cdecl *PFN_LogiSteeringShutdown)();
+
+	PFN_LogiSteeringInitialize m_pfnInit;
+	PFN_LogiUpdate m_pfnUpdate;
+	PFN_LogiIsConnected m_pfnIsConnected;
+	PFN_LogiPlayLeds m_pfnPlayLeds;
+	PFN_LogiSteeringShutdown m_pfnShutdown;
 };
