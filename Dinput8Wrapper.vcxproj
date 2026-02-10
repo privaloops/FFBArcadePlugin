@@ -334,7 +334,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>Debug</GenerateDebugInformation>
       <ModuleDefinitionFile>dinput8.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;xinput.lib;Common Files/MinHook/x86/Debug/MinHook.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;xinput.lib;Common Files/MinHook/x86/Debug/MinHook.lib;Common Files/LogitechSDK/x86/LogitechSteeringWheelLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>libcmt.lib</IgnoreSpecificDefaultLibraries>
     </Link>
     <ResourceCompile>
@@ -368,7 +368,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>Debug</GenerateDebugInformation>
       <ModuleDefinitionFile>dinput8.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;xinput.lib;Common Files/MinHook/x64/Debug/MinHook.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;xinput.lib;Common Files/MinHook/x64/Debug/MinHook.lib;Common Files/LogitechSDK/x64/LogitechSteeringWheelLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>libcmtd.lib</IgnoreSpecificDefaultLibraries>
     </Link>
     <ResourceCompile>
@@ -403,7 +403,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>No</GenerateDebugInformation>
       <ModuleDefinitionFile>dinput8.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Common Files/MinHook/x86/Release/MinHook.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Common Files/MinHook/x86/Release/MinHook.lib;Common Files/LogitechSDK/x86/LogitechSteeringWheelLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImageHasSafeExceptionHandlers />
       <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
       <IgnoreSpecificDefaultLibraries>libcmt.lib</IgnoreSpecificDefaultLibraries>
@@ -456,7 +456,7 @@ cd $(OutDir) &amp;amp;&amp;amp; for /D /r %d in (.\Deploy\*) do @xcopy *.dll %d\
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>No</GenerateDebugInformation>
       <ModuleDefinitionFile>dinput8.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Common Files/MinHook/x64/Release/MinHook.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dinput8.lib;dxguid.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;Common Files/MinHook/x64/Release/MinHook.lib;Common Files/LogitechSDK/x64/LogitechSteeringWheelLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>
       </IgnoreAllDefaultLibraries>
       <IgnoreSpecificDefaultLibraries>libcmt.lib</IgnoreSpecificDefaultLibraries>

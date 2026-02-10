@@ -1,40 +1,8 @@
 #include "LogitechLED.h"
+#include "LogitechSDK/LogitechSteeringWheelLib.h"
 
 #include <stdio.h>
 #include <stdarg.h>
-
-// --- Logitech LED Escape protocol (from SDK "Independent" sample) ---
-
-static const DWORD ESCAPE_COMMAND_LEDS = 0;
-static const DWORD LEDS_VERSION_NUMBER = 0x00000001;
-
-struct LedsRpmData
-{
-	FLOAT currentRPM;
-	FLOAT rpmFirstLedTurnsOn;
-	FLOAT rpmRedLine;
-};
-
-struct WheelData
-{
-	DWORD size;
-	DWORD versionNbr;
-	LedsRpmData rpmData;
-};
-
-// --- Known Logitech wheel VID/PIDs ---
-
-static const DWORD LOGITECH_VID = 0x046D;
-static const DWORD KNOWN_PIDS[] = {
-	0xC24F,  // G29
-	0xC260,  // G920 (no RPM LEDs but detected for completeness)
-	0xC262,  // G920 Xbox
-	0xC266,  // G923 PS
-	0xC267,  // G923 PS (alt)
-	0xC26D,  // G923 Xbox (alt PID)
-	0xC26E,  // G923 Xbox
-};
-static const int NUM_PIDS = sizeof(KNOWN_PIDS) / sizeof(KNOWN_PIDS[0]);
 
 // --- Logging ---
 
@@ -56,20 +24,10 @@ static void Log(const char* fmt, ...)
 	OutputDebugStringA("\n");
 }
 
-static bool IsKnownPID(DWORD pid)
-{
-	for (int i = 0; i < NUM_PIDS; i++)
-		if (KNOWN_PIDS[i] == pid) return true;
-	return false;
-}
-
 // --- LogitechLED ---
 
 LogitechLED::LogitechLED()
-	: m_dinputDll(NULL)
-	, m_pDI(NULL)
-	, m_pDevice(NULL)
-	, m_available(false)
+	: m_available(false)
 {
 }
 
@@ -80,26 +38,12 @@ LogitechLED::~LogitechLED()
 
 void LogitechLED::Close()
 {
-	if (m_pDevice)
+	if (m_available)
 	{
-		m_pDevice->Unacquire();
-		m_pDevice->Release();
-		m_pDevice = NULL;
+		LogiSteeringShutdown();
+		m_available = false;
+		Log("LogitechLED shutdown");
 	}
-
-	if (m_pDI)
-	{
-		m_pDI->Release();
-		m_pDI = NULL;
-	}
-
-	if (m_dinputDll)
-	{
-		FreeLibrary(m_dinputDll);
-		m_dinputDll = NULL;
-	}
-
-	m_available = false;
 }
 
 bool LogitechLED::IsAvailable() const
@@ -107,169 +51,53 @@ bool LogitechLED::IsAvailable() const
 	return m_available;
 }
 
-// --- Device enumeration callback ---
-
-BOOL CALLBACK LogitechLED::EnumDevicesCallback(LPCDIDEVICEINSTANCEA lpddi, LPVOID pvRef)
-{
-	EnumContext* ctx = (EnumContext*)pvRef;
-
-	DWORD vid = LOWORD(lpddi->guidProduct.Data1);
-	DWORD pid = HIWORD(lpddi->guidProduct.Data1);
-
-	Log("  Enum: VID=0x%04X PID=0x%04X Name='%s'", vid, pid, lpddi->tszProductName);
-
-	if (vid == LOGITECH_VID && IsKnownPID(pid))
-	{
-		Log("  -> Logitech wheel found!");
-		ctx->deviceGuid = lpddi->guidInstance;
-		ctx->found = true;
-		return DIENUM_STOP;
-	}
-
-	return DIENUM_CONTINUE;
-}
-
-// --- Init ---
-
 bool LogitechLED::Init()
 {
-	Log("LogitechLED::Init() - DirectInput Escape mode");
+	Log("LogitechLED::Init() - Logitech SDK (static link)");
 
 	if (m_available)
 		return true;
 
-	// Load the REAL dinput8.dll from System32 (not our wrapper)
-	char sysDir[MAX_PATH];
-	GetSystemDirectoryA(sysDir, MAX_PATH);
-	strcat_s(sysDir, "\\dinput8.dll");
-
-	m_dinputDll = LoadLibraryA(sysDir);
-	if (!m_dinputDll)
-	{
-		Log("Failed to load real dinput8.dll from %s (err=%lu)", sysDir, GetLastError());
-		return false;
-	}
-
-	Log("Real dinput8.dll loaded from %s", sysDir);
-
-	// Get the real DirectInput8Create
-	typedef HRESULT(WINAPI* PFN_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-	PFN_DirectInput8Create pfnCreate = (PFN_DirectInput8Create)GetProcAddress(m_dinputDll, "DirectInput8Create");
-	if (!pfnCreate)
-	{
-		Log("DirectInput8Create not found in real dinput8.dll");
-		Close();
-		return false;
-	}
-
-	// Create DirectInput interface
-	HRESULT hr = pfnCreate(GetModuleHandle(NULL), DIRECTINPUT_VERSION, IID_IDirectInput8A, (LPVOID*)&m_pDI, NULL);
-	if (FAILED(hr))
-	{
-		Log("DirectInput8Create failed (hr=0x%08X)", hr);
-		Close();
-		return false;
-	}
-
-	Log("DirectInput8 interface created");
-
-	// Enumerate game controllers to find Logitech wheel
-	EnumContext ctx = {};
-	ctx.found = false;
-
-	Log("Enumerating game controllers...");
-	m_pDI->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumDevicesCallback, &ctx, DIEDFL_ATTACHEDONLY);
-
-	if (!ctx.found)
-	{
-		Log("No Logitech wheel found");
-		Close();
-		return false;
-	}
-
-	// Create device
-	hr = m_pDI->CreateDevice(ctx.deviceGuid, &m_pDevice, NULL);
-	if (FAILED(hr))
-	{
-		Log("CreateDevice failed (hr=0x%08X)", hr);
-		Close();
-		return false;
-	}
-
-	// Set data format
-	hr = m_pDevice->SetDataFormat(&c_dfDIJoystick2);
-	if (FAILED(hr))
-	{
-		Log("SetDataFormat failed (hr=0x%08X)", hr);
-		Close();
-		return false;
-	}
-
-	// Set cooperative level: background + non-exclusive (don't steal from game)
+	// Try init with foreground window first, then without
 	HWND hwnd = GetForegroundWindow();
-	if (!hwnd) hwnd = GetDesktopWindow();
+	bool initOk = false;
 
-	hr = m_pDevice->SetCooperativeLevel(hwnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
-	if (FAILED(hr))
+	if (hwnd)
 	{
-		Log("SetCooperativeLevel failed (hr=0x%08X)", hr);
-		Close();
+		Log("Trying LogiSteeringInitializeWithWindow (hwnd=%p)", hwnd);
+		initOk = LogiSteeringInitializeWithWindow(false, hwnd);
+	}
+
+	if (!initOk)
+	{
+		Log("Trying LogiSteeringInitialize (no window)");
+		initOk = LogiSteeringInitialize(false);
+	}
+
+	if (!initOk)
+	{
+		Log("SDK init failed - is G Hub running? Is LogitechSteeringWheelEnginesWrapper.dll present?");
 		return false;
 	}
 
-	// Acquire the device
-	hr = m_pDevice->Acquire();
-	if (FAILED(hr))
+	Log("SDK initialized");
+
+	// Give SDK time to enumerate
+	LogiUpdate();
+
+	if (LogiIsConnected(0))
 	{
-		Log("Acquire failed (hr=0x%08X)", hr);
-		Close();
-		return false;
+		wchar_t name[256] = {};
+		LogiGetFriendlyProductName(0, name, 256);
+		Log("Wheel connected at index 0: %ls", name);
 	}
-
-	Log("Device acquired, testing Escape LED command...");
-
-	// Test: try to clear LEDs to verify Escape() works
-	if (!PlayLedsEscape(0.0f, 200.0f, 1000.0f))
+	else
 	{
-		Log("Escape LED command not supported on this device");
-		Close();
-		return false;
+		Log("No wheel detected yet (will retry on first LED update)");
 	}
 
 	m_available = true;
-	Log("LogitechLED ready (DirectInput Escape mode)");
-	return true;
-}
-
-// --- LED control via Escape ---
-
-bool LogitechLED::PlayLedsEscape(float currentRPM, float rpmFirstLed, float rpmRedLine)
-{
-	if (!m_pDevice)
-		return false;
-
-	WheelData wheelData;
-	ZeroMemory(&wheelData, sizeof(wheelData));
-	wheelData.size = sizeof(WheelData);
-	wheelData.versionNbr = LEDS_VERSION_NUMBER;
-	wheelData.rpmData.currentRPM = currentRPM;
-	wheelData.rpmData.rpmFirstLedTurnsOn = rpmFirstLed;
-	wheelData.rpmData.rpmRedLine = rpmRedLine;
-
-	DIEFFESCAPE escape;
-	ZeroMemory(&escape, sizeof(escape));
-	escape.dwSize = sizeof(DIEFFESCAPE);
-	escape.dwCommand = ESCAPE_COMMAND_LEDS;
-	escape.lpvInBuffer = &wheelData;
-	escape.cbInBuffer = sizeof(wheelData);
-
-	HRESULT hr = m_pDevice->Escape(&escape);
-	if (FAILED(hr))
-	{
-		Log("Escape failed (hr=0x%08X)", hr);
-		return false;
-	}
-
+	Log("LogitechLED ready");
 	return true;
 }
 
@@ -281,9 +109,13 @@ bool LogitechLED::SetLEDsFromPercent(double percent)
 	if (percent < 0.0) percent = 0.0;
 	if (percent > 1.0) percent = 1.0;
 
+	LogiUpdate();
+
 	// Map FFB strength (0.0-1.0) to RPM values
+	// rpmFirstLed=200: first LED at ~20% strength
+	// rpmRedLine=1000: all LEDs at 100% strength
 	float currentRPM = (float)(percent * 1000.0);
-	return PlayLedsEscape(currentRPM, 200.0f, 1000.0f);
+	return LogiPlayLeds(0, currentRPM, 200.0f, 1000.0f);
 }
 
 bool LogitechLED::SetLEDs(BYTE ledMask)
@@ -303,5 +135,6 @@ bool LogitechLED::ClearLEDs()
 	if (!m_available)
 		return false;
 
-	return PlayLedsEscape(0.0f, 200.0f, 1000.0f);
+	LogiUpdate();
+	return LogiPlayLeds(0, 0.0f, 200.0f, 1000.0f);
 }
