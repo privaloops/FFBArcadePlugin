@@ -22,12 +22,23 @@ static const USHORT G29_PID       = 0xC24F;
 static const BYTE LOGITECH_CMD_SET_LED = 0xF8;
 static const BYTE LOGITECH_LED_SUBCMD  = 0x12;
 
-// Forward declaration for logging (defined in DllMain.cpp)
-extern void LogMessage(const char* fmt, ...);
+// File-based logging for LED diagnostics
+static FILE* g_ledLogFile = NULL;
 
-// Simple log helper - uses OutputDebugString if LogMessage is not available
+static void LEDLogInit()
+{
+	if (g_ledLogFile) return;
+	g_ledLogFile = fopen("FFBPlugin_LED.log", "w");
+}
+
 static void LEDLog(const char* msg)
 {
+	LEDLogInit();
+	if (g_ledLogFile)
+	{
+		fprintf(g_ledLogFile, "%s\n", msg);
+		fflush(g_ledLogFile);
+	}
 	OutputDebugStringA(msg);
 	OutputDebugStringA("\n");
 }
@@ -46,10 +57,15 @@ LogitechLED::~LogitechLED()
 
 bool LogitechLED::Init()
 {
+	LEDLog("LogitechLED::Init() called");
 	if (m_available)
 		return true;
 
 	m_available = FindAndOpenDevice();
+	if (m_available)
+		LEDLog("LogitechLED::Init() SUCCESS - device opened");
+	else
+		LEDLog("LogitechLED::Init() FAILED - no compatible device found");
 	return m_available;
 }
 
@@ -91,20 +107,27 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 	report[7] = 0x01;
 
 	DWORD bytesWritten = 0;
+	char buf[256];
+	sprintf_s(buf, "LogitechLED: SetLEDs mask=0x%02X reportLen=%u", ledMask, m_outputReportLength);
+	LEDLog(buf);
+
 	BOOL result = WriteFile(m_deviceHandle, report, m_outputReportLength, &bytesWritten, NULL);
 
 	if (!result)
 	{
 		DWORD err = GetLastError();
-		char buf[256];
-		sprintf_s(buf, "LogitechLED: WriteFile failed, error=%lu, reportLen=%u, mask=0x%02X",
-			err, m_outputReportLength, ledMask);
+		sprintf_s(buf, "LogitechLED: WriteFile FAILED, error=%lu", err);
 		LEDLog(buf);
 
 		if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_GEN_FAILURE)
 		{
 			Close();
 		}
+	}
+	else
+	{
+		sprintf_s(buf, "LogitechLED: WriteFile OK, bytesWritten=%lu", bytesWritten);
+		LEDLog(buf);
 	}
 
 	free(report);
