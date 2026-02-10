@@ -484,10 +484,3 @@ bool LogitechLED::Init()
 	return false;
 }
 
-bool LogitechLED::SetLEDs(BYTE ledMask)
-{
-	if (!m_available || m_handle == INVALID_HANDLE_VALUE || m_templateLen == 0)
-		return false;
-
-	return false;  // Will be implemented once we know the working method
-}
