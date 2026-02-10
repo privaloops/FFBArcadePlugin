@@ -3,8 +3,8 @@
 #include <windows.h>
 
 // Logitech G923/G29 RPM LED controller via HID
-// Probes ALL HID collections with multiple write methods at init time
-// to find a working LED command path.
+// G923 Xbox: HID++ protocol via WriteFile on vendor collection
+// G29/G923 PS: Legacy 0xF8 command
 
 class LogitechLED
 {
@@ -31,16 +31,29 @@ private:
 		USHORT usagePage;
 	};
 
-	// The working method found during Init
-	HANDLE m_handle;
+	HANDLE m_writeHandle;     // Sync handle for WriteFile / HidD_SetOutputReport
+	HANDLE m_readHandle;      // Overlapped handle for ReadFile with timeout
 	bool m_available;
-	bool m_methodFound;      // true = a working write method was found
-	USHORT m_reportLen;      // output report length of the working path
-	BYTE m_reportId;         // report ID that worked (first byte)
-	BYTE m_cmdOffset;        // offset of 0xF8 command in the report
-	bool m_useSetReport;     // true = HidD_SetOutputReport, false = WriteFile
+	USHORT m_reportLen;
+	USHORT m_inputReportLen;
 
-	bool ProbeAllDevices();
-	bool TryWrite(HANDLE h, USHORT reportLen, BYTE reportId, BYTE cmdOffset,
-	              bool useSetReport, BYTE ledMask, const char* desc);
+	// LED method (determined at init)
+	enum LEDMethod { METHOD_NONE, METHOD_LEGACY, METHOD_HIDPP };
+	LEDMethod m_method;
+	BYTE m_ledFeatureIndex;   // HID++ feature index for LED control
+
+	bool FindDevice(char* outPath, int pathSize, USHORT* outReportLen,
+	                USHORT* outInputLen, bool* outIsVendor);
+
+	// Legacy protocol
+	bool SetLEDsLegacy(BYTE ledMask);
+
+	// HID++ protocol via WriteFile
+	bool InitHIDPP();
+	bool SetLEDsHIDPP(BYTE ledMask);
+	bool HIDPPSendLong(BYTE deviceIdx, BYTE featureIdx, BYTE funcSwId,
+	                    const BYTE* params, int paramLen);
+	bool HIDPPRecv(BYTE* response, int responseLen, DWORD timeoutMs);
+	BYTE HIDPPDiscoverFeature(USHORT featureId);
+	void HIDPPEnumerateAllFeatures();
 };
