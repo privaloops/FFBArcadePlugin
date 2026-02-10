@@ -43,6 +43,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: FFBArcadePlugin-${{ matrix.configuration }}-${{ matrix.platform }}
-          path: |
-            ${{ matrix.configuration }}.${{ matrix.platform == 'x86' && 'Win32' || matrix.platform }}/*.dll
-            ${{ matrix.configuration }}.${{ matrix.platform == 'x86' && 'Win32' || matrix.platform }}/*.ini
+          path: ${{ matrix.configuration }}.${{ matrix.platform == 'x86' && 'Win32' || matrix.platform }}/
