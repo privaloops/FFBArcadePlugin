@@ -281,6 +281,9 @@ bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 		// --- Enumerate ALL features ---
 		BYTE bestLedIdx = 0;
 		USHORT bestLedFid = 0;
+		BYTE probeIdx[8] = {0};
+		USHORT probeFid[8] = {0};
+		int numProbe = 0;
 
 		for (int fi = 1; fi <= featureCount && fi < 128; fi++)
 		{
@@ -301,17 +304,24 @@ bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 			BYTE ftype = resp[6];
 
 			const char* name = "";
+			bool isKnown = true;
 			switch (fid)
 			{
 				case 0x0001: name = " (IFeatureSet)"; break;
 				case 0x0003: name = " (DeviceInfo)"; break;
 				case 0x0005: name = " (DeviceName)"; break;
 				case 0x0007: name = " (FriendlyName)"; break;
+				case 0x00C1: name = " (DfuControlUnsigned)"; break;
 				case 0x00C2: name = " (DfuControl)"; break;
 				case 0x00D0: name = " (Dfu)"; break;
 				case 0x1000: name = " (BatteryStatus)"; break;
 				case 0x1300: name = " (LEDControl)"; break;
+				case 0x1800: name = " (GenericTest)"; break;
+				case 0x1802: name = " (DeviceReset)"; break;
 				case 0x1814: name = " (ChangeHost)"; break;
+				case 0x1BC0: name = " (ReportHIDUsage)"; break;
+				case 0x1E00: name = " (EnableHiddenFeatures)"; break;
+				case 0x1F1F: name = " (FirmwareProperties)"; break;
 				case 0x1982: name = " (Backlight2)"; break;
 				case 0x1B04: name = " (SpecialKeys)"; break;
 				case 0x2201: name = " (AdjDPI)"; break;
@@ -321,14 +331,21 @@ bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 				case 0x8071: name = " (RGBEffects)"; break;
 				case 0x8081: name = " (PerKeyLighting)"; break;
 				case 0x8100: name = " (OnboardProfiles)"; break;
+				case 0x8120: name = " (GamingAttachments)"; break;
+				case 0x8123: name = " (ForceFeedback)"; break;
+				case 0x8127: name = " (ForceFeedbackG923)"; break;
+				default: isKnown = false; break;
 			}
 
 			Log("    [%02d] 0x%04X type=0x%02X%s", fi, fid, ftype, name);
 
-			// Track LED-related features
+			// Track candidate features to probe for LED control:
+			// 1. Known LED features
+			// 2. ANY unknown feature in 0x80xx range (could be wheel-specific LEDs)
 			if (fid == 0x8070 || fid == 0x1300 || fid == 0x8071 ||
 			    fid == 0x8040 || fid == 0x1982)
 			{
+				// Known LED features - highest priority
 				if (bestLedIdx == 0 || fid == 0x8070 ||
 				    (bestLedFid != 0x8070 && fid == 0x1300))
 				{
@@ -336,101 +353,115 @@ bool LogitechLED::TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen)
 					bestLedFid = fid;
 				}
 			}
+
+			// Store ALL unknown 0x8xxx features for probing
+			if (!isKnown && (fid & 0xF000) == 0x8000 && numProbe < 8)
+			{
+				probeIdx[numProbe] = (BYTE)fi;
+				probeFid[numProbe] = fid;
+				numProbe++;
+			}
 		}
 
 		Log("");
+
+		// --- Probe known LED features first ---
+		if (bestLedIdx != 0)
+		{
+			Log("  >>> Known LED feature: 0x%04X at index %d", bestLedFid, bestLedIdx);
+		}
+		else
+		{
+			Log("  No standard LED feature found");
+			if (numProbe > 0)
+				Log("  Will probe %d unknown 0x8xxx features", numProbe);
+		}
+
+		// If no known LED feature, use the first unknown 0x8xxx feature
+		if (bestLedIdx == 0 && numProbe > 0)
+		{
+			bestLedIdx = probeIdx[0];
+			bestLedFid = probeFid[0];
+			Log("  >>> Trying unknown feature 0x%04X at index %d", bestLedFid, bestLedIdx);
+		}
 
 		if (bestLedIdx == 0)
 		{
-			Log("  No LED-related feature found");
-			Log("  Check feature list above for alternative LED features");
+			Log("  Nothing to probe");
 			continue;
 		}
 
-		Log("  >>> LED feature: 0x%04X at index %d", bestLedFid, bestLedIdx);
+		// --- Probe ALL unknown 0x8xxx features with getInfo ---
 		Log("");
-
-		// --- Probe LED feature: call func0 (getInfo) ---
-		memset(req, 0, sizeof(req));
-		req[0] = reportId;
-		req[1] = devIdx;
-		req[2] = bestLedIdx;
-		req[3] = (0 << 4) | 0x01;
-
-		Log("  LED func0 (getInfo):");
-		if (SendReport(h, req, outLen))
-		{
-			memset(resp, 0, sizeof(resp));
-			if (ReadReport(h, resp, inLen, 500))
-			{
-				if (resp[2] == 0xFF)
-					Log("    error: 0x%02X", resp[5]);
-				else
-					Log("    data: %02X %02X %02X %02X %02X %02X %02X %02X",
-						resp[4], resp[5], resp[6], resp[7],
-						resp[8], resp[9], resp[10], resp[11]);
-			}
-			else Log("    no response");
-		}
-
-		// --- Try LED control commands ---
-		Log("");
-		Log("  === LED ATTEMPTS (watch the wheel!) ===");
-
-		struct LedTry { BYTE func; BYTE p[8]; const char* desc; };
-		LedTry tries[] = {
-			{ 1, {0x1F,0x00,0,0,0,0,0,0}, "func1(mask=0x1F)" },
-			{ 1, {0x1F,0xFF,0,0,0,0,0,0}, "func1(0x1F,0xFF)" },
-			{ 2, {0x1F,0x00,0,0,0,0,0,0}, "func2(mask=0x1F)" },
-			{ 2, {0x1F,0xFF,0,0,0,0,0,0}, "func2(0x1F,0xFF)" },
-			{ 3, {0x1F,0x00,0,0,0,0,0,0}, "func3(mask=0x1F)" },
-			{ 1, {0x00,0x01,0,0,0,0,0,0}, "func1(led=0,on)" },
-			{ 2, {0x00,0x01,0,0,0,0,0,0}, "func2(led=0,on)" },
-			{ 1, {0xFF,0x00,0,0,0,0,0,0}, "func1(0xFF)" },
-			{ 2, {0xFF,0x00,0,0,0,0,0,0}, "func2(0xFF)" },
-			{ 1, {0x64,0x00,0,0,0,0,0,0}, "func1(rpm=100)" },
-		};
-		int numTries = sizeof(tries) / sizeof(tries[0]);
-		BYTE workingFunc = 0;
-
-		for (int t = 0; t < numTries; t++)
+		Log("  === Probing unknown features ===");
+		for (int pi = 0; pi < numProbe; pi++)
 		{
 			memset(req, 0, sizeof(req));
 			req[0] = reportId;
 			req[1] = devIdx;
-			req[2] = bestLedIdx;
-			req[3] = (tries[t].func << 4) | 0x01;
-			memcpy(&req[4], tries[t].p, 8);
+			req[2] = probeIdx[pi];
+			req[3] = (0 << 4) | 0x01;  // func0 = getInfo
 
-			bool ok = SendReport(h, req, outLen);
-
-			BYTE tryResp[64] = {0};
-			bool gotResp = ok ? ReadReport(h, tryResp, inLen, 300) : false;
-
-			if (!ok)
-				Log("  [%02d] %-22s SEND FAIL", t, tries[t].desc);
-			else if (gotResp && tryResp[2] == 0xFF)
-				Log("  [%02d] %-22s ERR 0x%02X", t, tries[t].desc, tryResp[5]);
-			else if (gotResp)
+			if (SendReport(h, req, outLen))
 			{
-				Log("  [%02d] %-22s OK resp=%02X %02X %02X %02X",
-					t, tries[t].desc,
-					tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
-				if (workingFunc == 0) workingFunc = tries[t].func;
+				memset(resp, 0, sizeof(resp));
+				if (ReadReport(h, resp, inLen, 500))
+				{
+					if (resp[2] == 0xFF)
+						Log("  0x%04X[%d] func0: ERR 0x%02X",
+							probeFid[pi], probeIdx[pi], resp[5]);
+					else
+						Log("  0x%04X[%d] func0: %02X %02X %02X %02X %02X %02X %02X %02X",
+							probeFid[pi], probeIdx[pi],
+							resp[4], resp[5], resp[6], resp[7],
+							resp[8], resp[9], resp[10], resp[11]);
+				}
+				else
+					Log("  0x%04X[%d] func0: no response", probeFid[pi], probeIdx[pi]);
 			}
-			else
-			{
-				Log("  [%02d] %-22s OK (no resp)", t, tries[t].desc);
-				if (workingFunc == 0) workingFunc = tries[t].func;
-			}
-
-			Sleep(400);
 		}
 
-		// Save whatever we found
+		// --- Try LED commands on each unknown 0x8xxx feature ---
+		Log("");
+		Log("  === LED attempts on unknown features (WATCH THE WHEEL!) ===");
+
+		for (int pi = 0; pi < numProbe; pi++)
+		{
+			Log("");
+			Log("  --- Feature 0x%04X at index %d ---", probeFid[pi], probeIdx[pi]);
+
+			// Try func1-3 with LED bitmask 0x1F (all 5 LEDs)
+			for (BYTE funcId = 1; funcId <= 3; funcId++)
+			{
+				memset(req, 0, sizeof(req));
+				req[0] = reportId;
+				req[1] = devIdx;
+				req[2] = probeIdx[pi];
+				req[3] = (funcId << 4) | 0x01;
+				req[4] = 0x1F;  // all LEDs on
+
+				bool ok = SendReport(h, req, outLen);
+				BYTE tryResp[64] = {0};
+				bool gotResp = ok ? ReadReport(h, tryResp, inLen, 300) : false;
+
+				if (!ok)
+					Log("    func%d(0x1F): SEND FAIL", funcId);
+				else if (gotResp && tryResp[2] == 0xFF)
+					Log("    func%d(0x1F): ERR 0x%02X", funcId, tryResp[5]);
+				else if (gotResp)
+					Log("    func%d(0x1F): OK resp=%02X %02X %02X %02X",
+						funcId, tryResp[4], tryResp[5], tryResp[6], tryResp[7]);
+				else
+					Log("    func%d(0x1F): OK (no resp)", funcId);
+
+				Sleep(400);
+			}
+		}
+
+		// Save best guess
 		m_method = METHOD_HIDPP;
 		m_ledFeatureIdx = bestLedIdx;
-		m_ledFunctionId = (workingFunc > 0) ? workingFunc : 1;
+		m_ledFunctionId = 1;
 		m_deviceIdx = devIdx;
 		Log("");
 		Log("  HID++ saved: feat=0x%04X idx=%d func=%d devIdx=0x%02X",
