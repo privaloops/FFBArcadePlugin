@@ -58,6 +58,9 @@ static LogiPlayLeds_t                g_PlayLeds = NULL;
 static LogiSteeringShutdown_t        g_SteeringShutdown = NULL;
 static bool                          g_SteeringNeedsLateInit = false;
 
+// Bypass flag declared in DllMain.cpp
+extern volatile bool g_bypassDIWrapper;
+
 // --- G Hub LED SDK function pointers ---
 
 typedef bool (*LogiLedInit_t)();
@@ -294,6 +297,10 @@ bool LogitechLED::TrySteeringSDK()
 		return false;
 	}
 
+	// Bypass our dinput8 wrapper so the SDK can enumerate real DirectInput devices
+	Log("  Enabling DirectInput bypass for SDK enumeration...");
+	g_bypassDIWrapper = true;
+
 	// Try immediate init with multiple approaches
 	bool ok = false;
 
@@ -325,12 +332,12 @@ bool LogitechLED::TrySteeringSDK()
 
 	if (ok)
 	{
-		// Init succeeded - enumerate and test
+		// Init succeeded - enumerate and test (keep bypass active)
 		Log("  Init succeeded, enumerating...");
 
-		for (int retry = 0; retry < 10; retry++)
+		for (int retry = 0; retry < 20; retry++)
 		{
-			Sleep(200);
+			Sleep(300);
 			g_SteeringUpdate();
 			if (g_IsConnected(0))
 			{
@@ -338,6 +345,8 @@ bool LogitechLED::TrySteeringSDK()
 				break;
 			}
 		}
+
+		g_bypassDIWrapper = false;  // SDK done enumerating
 
 		bool connected = g_IsConnected(0);
 		Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
@@ -374,6 +383,8 @@ bool LogitechLED::TrySteeringSDK()
 		Log("=== LED CONTROL ACTIVE (Steering Wheel SDK) ===");
 		return true;
 	}
+
+	g_bypassDIWrapper = false;  // Restore wrapper
 
 	// Init failed
 	Log("  Steering SDK init failed - falling through");
@@ -673,7 +684,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v7 ===");
+	Log("=== LogitechLED Init v8 ===");
 	Log("");
 
 	if (m_available) return true;

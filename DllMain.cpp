@@ -842,10 +842,17 @@ HRESULT WINAPI DirectInputDirectInputCreateEx(HINSTANCE hinst, DWORD dwVersion, 
 	return res;
 }
 // DINPUT8 WRAPPER
+volatile bool g_bypassDIWrapper = false;  // Set by LogitechLED to let SDK use real DirectInput
+
 HRESULT WINAPI DirectInputDirectInput8Create(HINSTANCE hinst, DWORD dwVersion, REFIID riidltf, LPVOID* ppvOut, LPUNKNOWN punkOuter)
 {
 	LPVOID val;
 	HRESULT res = originalDirectInputDirectInput8Create(hinst, dwVersion, riidltf, &val, punkOuter);
+	if (g_bypassDIWrapper)
+	{
+		*ppvOut = val;  // Return real interface for Logitech SDK
+		return res;
+	}
 	*ppvOut = new DirectInputDeviceWrapper(val, (IID_IDirectInput8W == riidltf));
 	return res;
 }
