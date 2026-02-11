@@ -186,6 +186,32 @@ static void DumpExports(HMODULE dll, const char* label)
 	Log("  --- END ---");
 }
 
+// DirectInput device enumeration callback (must be __stdcall, not lambda)
+struct EnumWheelCtx { GUID guid; bool found; };
+
+static BOOL CALLBACK EnumWheelCB(LPCDIDEVICEINSTANCEA lpddi, LPVOID pvRef)
+{
+	EnumWheelCtx* ctx = (EnumWheelCtx*)pvRef;
+
+	// Extract VID/PID from the device GUID
+	DWORD vidpid = lpddi->guidProduct.Data1;
+	USHORT vid = (USHORT)(vidpid & 0xFFFF);
+	USHORT pid = (USHORT)((vidpid >> 16) & 0xFFFF);
+
+	Log("  DI device: \"%s\" type=0x%08lX VID=0x%04X PID=0x%04X",
+		lpddi->tszInstanceName, lpddi->dwDevType, vid, pid);
+
+	if (vid == LOGITECH_VID && IsKnownPID(pid))
+	{
+		Log("  >>> Logitech wheel match! PID=0x%04X", pid);
+		ctx->guid = lpddi->guidInstance;
+		ctx->found = true;
+		return DIENUM_STOP;
+	}
+
+	return DIENUM_CONTINUE;
+}
+
 bool LogitechLED::TrySteeringSDK()
 {
 	Log("=== Phase 0: Steering Wheel SDK ===");
@@ -419,27 +445,17 @@ bool LogitechLED::TrySteeringSDK()
 
 					if (SUCCEEDED(hr) && g_realDI)
 					{
-						// Enumerate to find a Logitech wheel
-						struct EnumCtx { GUID guid; bool found; };
-						EnumCtx ctx = {{0}, false};
+						// Enumerate ALL devices to find a Logitech wheel
+						EnumWheelCtx enumCtx;
+						memset(&enumCtx, 0, sizeof(enumCtx));
 
-						g_realDI->EnumDevices(DI8DEVCLASS_GAMECTRL,
-							[](const DIDEVICEINSTANCEA* inst, VOID* pCtx) -> BOOL {
-								EnumCtx* c = (EnumCtx*)pCtx;
-								USHORT vid = LOWORD(inst->guidProduct.Data1);
-								USHORT pid = HIWORD(inst->guidProduct.Data1);
-								Log("    DI device: VID=0x%04X PID=0x%04X '%s'",
-									vid, pid, inst->tszInstanceName);
-								if (vid == 0x046D && IsKnownPID(pid))
-								{
-									c->guid = inst->guidInstance;
-									c->found = true;
-									return DIENUM_STOP;
-								}
-								return DIENUM_CONTINUE;
-							}, &ctx, DIEDFL_ATTACHEDONLY);
+						Log("  Enumerating ALL DirectInput devices...");
+						HRESULT enumHr = g_realDI->EnumDevices(0,
+							EnumWheelCB, &enumCtx, DIEDFL_ALLDEVICES);
+						Log("  EnumDevices returned 0x%08lX, found=%d",
+							enumHr, enumCtx.found);
 
-						if (!ctx.found)
+						if (!enumCtx.found)
 						{
 							Log("  No Logitech wheel found via real DirectInput");
 							g_realDI->Release();
@@ -447,7 +463,7 @@ bool LogitechLED::TrySteeringSDK()
 						}
 						else
 						{
-							hr = g_realDI->CreateDevice(ctx.guid, &g_realDIDevice, NULL);
+							hr = g_realDI->CreateDevice(enumCtx.guid, &g_realDIDevice, NULL);
 							Log("  CreateDevice -> 0x%08lX", hr);
 
 							if (SUCCEEDED(hr) && g_realDIDevice)
@@ -788,7 +804,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v9 ===");
+	Log("=== LogitechLED Init v10 ===");
 	Log("");
 
 	if (m_available) return true;
