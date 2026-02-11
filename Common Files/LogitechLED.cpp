@@ -401,12 +401,37 @@ bool LogitechLED::TryGHubWebSocket()
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		Log("  Register: %.300s", buf);
+	{
+		Log("  Register (%lu bytes): %.800s", bytesRead, buf);
+		// Extract integrationGuid from registration response
+		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
+		if (g_ghubIntegrationGuid[0])
+			Log("  Registration GUID: %s", g_ghubIntegrationGuid);
+		else
+			Log("  No integrationGuid in registration response");
+	}
 
-	// --- Step 3: Activate WHEEL first (ACTION before WHEEL corrupts GUID) ---
-	snprintf(sendBuf, sizeof(sendBuf),
-		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
+	// Wait for G Hub to fully process registration
+	Sleep(2000);
+
+	// Drain any intermediate messages from G Hub
+	while (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+		Log("  Drained: %.200s", buf);
+
+	// --- Step 3: Activate WHEEL (with integrationGuid if available) ---
+	if (g_ghubIntegrationGuid[0])
+	{
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\","
+			"\"integrationGuid\":\"%s\"}}", msgId++, g_ghubIntegrationGuid);
+	}
+	else
+	{
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
+	}
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
@@ -1365,7 +1390,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v16 (real system DInput fix) ===");
+	Log("=== LogitechLED Init v17 (extract registration GUID) ===");
 	Log("");
 
 	if (m_available) return true;
