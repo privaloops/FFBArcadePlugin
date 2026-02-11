@@ -7,8 +7,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "dxguid.lib")
 
 static const USHORT LOGITECH_VID = 0x046D;
 static const USHORT KNOWN_PIDS[] = { 0xC26E, 0xC26D, 0xC267, 0xC266, 0xC24F };
@@ -48,6 +52,7 @@ typedef bool (__cdecl *LogiSteeringInitWithWindow_t)(bool, HWND);
 typedef bool (__cdecl *LogiUpdate_t)();
 typedef bool (__cdecl *LogiIsConnected_t)(int);
 typedef bool (__cdecl *LogiPlayLeds_t)(int, float, float, float);
+typedef bool (__cdecl *LogiPlayLedsDInput_t)(LPDIRECTINPUTDEVICE8, float, float, float);
 typedef void (__cdecl *LogiSteeringShutdown_t)();
 
 static LogiSteeringInit_t            g_SteeringInit = NULL;
@@ -55,8 +60,11 @@ static LogiSteeringInitWithWindow_t  g_SteeringInitWithWindow = NULL;
 static LogiUpdate_t                  g_SteeringUpdate = NULL;
 static LogiIsConnected_t             g_IsConnected = NULL;
 static LogiPlayLeds_t                g_PlayLeds = NULL;
+static LogiPlayLedsDInput_t          g_PlayLedsDInput = NULL;
 static LogiSteeringShutdown_t        g_SteeringShutdown = NULL;
 static bool                          g_SteeringNeedsLateInit = false;
+static LPDIRECTINPUTDEVICE8A         g_realDIDevice = NULL;
+static LPDIRECTINPUT8A               g_realDI = NULL;
 
 // Bypass flag declared in DllMain.cpp
 extern volatile bool g_bypassDIWrapper;
@@ -106,8 +114,12 @@ LogitechLED::~LogitechLED()
 
 void LogitechLED::Close()
 {
-	if (m_method == METHOD_STEERING_SDK && g_SteeringShutdown)
-		g_SteeringShutdown();
+	if (m_method == METHOD_STEERING_SDK)
+	{
+		if (g_SteeringShutdown) g_SteeringShutdown();
+		if (g_realDIDevice) { g_realDIDevice->Release(); g_realDIDevice = NULL; }
+		if (g_realDI) { g_realDI->Release(); g_realDI = NULL; }
+	}
 
 	if (m_method == METHOD_SDK && g_LedShutdown)
 		g_LedShutdown();
@@ -137,6 +149,7 @@ void LogitechLED::Close()
 	g_SteeringUpdate = NULL;
 	g_IsConnected = NULL;
 	g_PlayLeds = NULL;
+	g_PlayLedsDInput = NULL;
 	g_SteeringShutdown = NULL;
 	g_SteeringNeedsLateInit = false;
 	g_LedInit = NULL;
@@ -269,6 +282,7 @@ bool LogitechLED::TrySteeringSDK()
 		g_IsConnected = (LogiIsConnected_t)GetProcAddress(m_steeringDll, connNames[i]);
 	for (int i = 0; ledsNames[i] && !g_PlayLeds; i++)
 		g_PlayLeds = (LogiPlayLeds_t)GetProcAddress(m_steeringDll, ledsNames[i]);
+	g_PlayLedsDInput = (LogiPlayLedsDInput_t)GetProcAddress(m_steeringDll, "LogiPlayLedsDInput");
 	for (int i = 0; shutNames[i] && !g_SteeringShutdown; i++)
 		g_SteeringShutdown = (LogiSteeringShutdown_t)GetProcAddress(m_steeringDll, shutNames[i]);
 
@@ -278,6 +292,7 @@ bool LogitechLED::TrySteeringSDK()
 	Log("    Update: %s", g_SteeringUpdate ? "FOUND" : "not found");
 	Log("    IsConnected: %s", g_IsConnected ? "FOUND" : "not found");
 	Log("    PlayLeds: %s", g_PlayLeds ? "FOUND" : "not found");
+	Log("    PlayLedsDInput: %s", g_PlayLedsDInput ? "FOUND" : "not found");
 	Log("    Shutdown: %s", g_SteeringShutdown ? "FOUND" : "not found");
 
 	if (!g_SteeringUpdate || !g_IsConnected || !g_PlayLeds)
@@ -351,37 +366,126 @@ bool LogitechLED::TrySteeringSDK()
 		bool connected = g_IsConnected(0);
 		Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
 
-		if (!connected)
+		if (connected)
 		{
-			Log("  Wheel not connected via this SDK");
-			if (g_SteeringShutdown) g_SteeringShutdown();
-			FreeLibrary(m_steeringDll);
-			m_steeringDll = NULL;
-			return false;
+			// Standard path: SDK found the wheel by index
+			g_SteeringUpdate();
+			bool led = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
+			Log("  LogiPlayLeds(0, 100, 0, 100) -> %s *** ALL LEDs ***", led ? "OK" : "FAIL");
+
+			if (led)
+			{
+				Sleep(1000);
+				g_SteeringUpdate();
+				g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
+				m_method = METHOD_STEERING_SDK;
+				m_available = true;
+				Log("=== LED CONTROL ACTIVE (Steering Wheel SDK) ===");
+				return true;
+			}
+			Log("  PlayLeds failed despite connection");
 		}
 
-		// Test LEDs
-		g_SteeringUpdate();
-		bool led = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
-		Log("  LogiPlayLeds(0, 100, 0, 100) -> %s *** ALL LEDs ***", led ? "OK" : "FAIL");
-
-		if (!led)
+		// Fallback: SDK doesn't know G923 PID, try LogiPlayLedsDInput
+		// Create a REAL DirectInput device bypassing our wrapper
+		if (g_PlayLedsDInput)
 		{
-			Log("  PlayLeds failed");
-			if (g_SteeringShutdown) g_SteeringShutdown();
-			FreeLibrary(m_steeringDll);
-			m_steeringDll = NULL;
-			return false;
+			Log("  Trying LogiPlayLedsDInput fallback...");
+
+			// Load the real system dinput8.dll
+			char sysDir[MAX_PATH];
+			GetSystemDirectoryA(sysDir, MAX_PATH);
+			strcat_s(sysDir, MAX_PATH, "\\dinput8.dll");
+
+			typedef HRESULT (WINAPI *DI8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+			HMODULE realDIDll = LoadLibraryA(sysDir);
+			if (!realDIDll)
+			{
+				Log("  Failed to load real dinput8.dll from %s", sysDir);
+			}
+			else
+			{
+				DI8Create_t realCreate = (DI8Create_t)GetProcAddress(realDIDll, "DirectInput8Create");
+				if (!realCreate)
+				{
+					Log("  DirectInput8Create not found in real dll");
+					FreeLibrary(realDIDll);
+				}
+				else
+				{
+					HRESULT hr = realCreate(GetModuleHandle(NULL), DIRECTINPUT_VERSION,
+						IID_IDirectInput8A, (LPVOID*)&g_realDI, NULL);
+					Log("  Real DirectInput8Create -> 0x%08lX", hr);
+
+					if (SUCCEEDED(hr) && g_realDI)
+					{
+						// Enumerate to find a Logitech wheel
+						struct EnumCtx { GUID guid; bool found; };
+						EnumCtx ctx = {{0}, false};
+
+						g_realDI->EnumDevices(DI8DEVCLASS_GAMECTRL,
+							[](const DIDEVICEINSTANCEA* inst, VOID* pCtx) -> BOOL {
+								EnumCtx* c = (EnumCtx*)pCtx;
+								USHORT vid = LOWORD(inst->guidProduct.Data1);
+								USHORT pid = HIWORD(inst->guidProduct.Data1);
+								Log("    DI device: VID=0x%04X PID=0x%04X '%s'",
+									vid, pid, inst->tszInstanceName);
+								if (vid == 0x046D && IsKnownPID(pid))
+								{
+									c->guid = inst->guidInstance;
+									c->found = true;
+									return DIENUM_STOP;
+								}
+								return DIENUM_CONTINUE;
+							}, &ctx, DIEDFL_ATTACHEDONLY);
+
+						if (!ctx.found)
+						{
+							Log("  No Logitech wheel found via real DirectInput");
+							g_realDI->Release();
+							g_realDI = NULL;
+						}
+						else
+						{
+							hr = g_realDI->CreateDevice(ctx.guid, &g_realDIDevice, NULL);
+							Log("  CreateDevice -> 0x%08lX", hr);
+
+							if (SUCCEEDED(hr) && g_realDIDevice)
+							{
+								// Test LogiPlayLedsDInput
+								g_SteeringUpdate();
+								bool led = g_PlayLedsDInput(g_realDIDevice, 100.0f, 0.0f, 100.0f);
+								Log("  LogiPlayLedsDInput(dev, 100, 0, 100) -> %s *** ALL LEDs ***",
+									led ? "OK" : "FAIL");
+
+								if (led)
+								{
+									Sleep(1000);
+									g_SteeringUpdate();
+									g_PlayLedsDInput(g_realDIDevice, 0.0f, 0.0f, 100.0f);
+									m_method = METHOD_STEERING_SDK;
+									m_available = true;
+									Log("=== LED CONTROL ACTIVE (Steering SDK + DInput) ===");
+									return true;
+								}
+
+								// Cleanup on failure
+								g_realDIDevice->Release();
+								g_realDIDevice = NULL;
+							}
+							g_realDI->Release();
+							g_realDI = NULL;
+						}
+					}
+				}
+			}
 		}
 
-		Sleep(1000);
-		g_SteeringUpdate();
-		g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
-
-		m_method = METHOD_STEERING_SDK;
-		m_available = true;
-		Log("=== LED CONTROL ACTIVE (Steering Wheel SDK) ===");
-		return true;
+		Log("  Steering SDK exhausted - falling through");
+		if (g_SteeringShutdown) g_SteeringShutdown();
+		FreeLibrary(m_steeringDll);
+		m_steeringDll = NULL;
+		return false;
 	}
 
 	g_bypassDIWrapper = false;  // Restore wrapper
@@ -824,57 +928,30 @@ bool LogitechLED::SetLEDsFromPercent(double percent)
 	if (percent > 1.0) percent = 1.0;
 
 	// For steering SDK, pass percentage directly as RPM for smooth LED progression
-	if (m_method == METHOD_STEERING_SDK && g_PlayLeds && g_SteeringUpdate)
+	if (m_method == METHOD_STEERING_SDK && g_SteeringUpdate)
 	{
-		// Deferred init: game window exists now
-		if (g_SteeringNeedsLateInit)
-		{
-			g_SteeringNeedsLateInit = false;
-			bool ok = false;
-
-			HWND fg = GetForegroundWindow();
-			if (fg && g_SteeringInitWithWindow)
-			{
-				ok = g_SteeringInitWithWindow(false, fg);
-				Log("  LATE InitWithWindow(false, hwnd=0x%p) -> %s", fg, ok ? "OK" : "FAIL");
-			}
-			if (!ok && g_SteeringInit)
-			{
-				ok = g_SteeringInit(false);
-				Log("  LATE LogiSteeringInitialize(false) -> %s", ok ? "OK" : "FAIL");
-			}
-
-			if (ok)
-			{
-				for (int retry = 0; retry < 10; retry++)
-				{
-					Sleep(200);
-					g_SteeringUpdate();
-					if (g_IsConnected(0))
-					{
-						Log("  LATE: Wheel connected (after %d updates)", retry + 1);
-						break;
-					}
-				}
-				Log("  LATE: LogiIsConnected(0) -> %s", g_IsConnected(0) ? "YES" : "NO");
-			}
-			else
-			{
-				Log("  LATE init also failed - steering SDK unavailable");
-				m_method = METHOD_NONE;
-				m_available = false;
-				return false;
-			}
-		}
-
 		float rpm = (float)(percent * 100.0);
 		g_SteeringUpdate();
-		bool ok = g_PlayLeds(0, rpm, 0.0f, 100.0f);
 
-		g_setLedsCallCount++;
-		if (g_setLedsCallCount <= 20 || !ok)
-			Log("SetLEDsFromPercent(%.2f) [SteeringSDK rpm=%.0f] -> %s (#%d)",
-				percent, rpm, ok ? "OK" : "FAIL", g_setLedsCallCount);
+		bool ok = false;
+
+		// Prefer LogiPlayLedsDInput (works without SDK device detection)
+		if (g_PlayLedsDInput && g_realDIDevice)
+		{
+			ok = g_PlayLedsDInput(g_realDIDevice, rpm, 0.0f, 100.0f);
+			g_setLedsCallCount++;
+			if (g_setLedsCallCount <= 20 || !ok)
+				Log("SetLEDsFromPercent(%.2f) [DInput rpm=%.0f] -> %s (#%d)",
+					percent, rpm, ok ? "OK" : "FAIL", g_setLedsCallCount);
+		}
+		else if (g_PlayLeds)
+		{
+			ok = g_PlayLeds(0, rpm, 0.0f, 100.0f);
+			g_setLedsCallCount++;
+			if (g_setLedsCallCount <= 20 || !ok)
+				Log("SetLEDsFromPercent(%.2f) [SteeringSDK rpm=%.0f] -> %s (#%d)",
+					percent, rpm, ok ? "OK" : "FAIL", g_setLedsCallCount);
+		}
 
 		return ok;
 	}
