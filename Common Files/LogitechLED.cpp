@@ -52,7 +52,7 @@ typedef bool (__cdecl *LogiSteeringInitWithWindow_t)(bool, HWND);
 typedef bool (__cdecl *LogiUpdate_t)();
 typedef bool (__cdecl *LogiIsConnected_t)(int);
 typedef bool (__cdecl *LogiPlayLeds_t)(int, float, float, float);
-typedef bool (__cdecl *LogiPlayLedsDInput_t)(LPDIRECTINPUTDEVICE8, float, float, float);
+typedef bool (__cdecl *LogiPlayLedsDInput_t)(LPVOID, float, float, float);  // accepts any LPDIRECTINPUTDEVICE8 variant
 typedef void (__cdecl *LogiSteeringShutdown_t)();
 
 static LogiSteeringInit_t            g_SteeringInit = NULL;
