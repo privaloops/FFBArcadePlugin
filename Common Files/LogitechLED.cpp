@@ -326,39 +326,33 @@ bool LogitechLED::TrySDK()
 
 	Log("  Loaded: %s", dllPath);
 
-	// Enumerate exported functions
-	const char* probeNames[] = {
-		"LogiLedInit", "LogiLedInitWithName",
-		"LogiLedSetTargetDevice", "LogiLedSetLighting",
-		"LogiLedSaveCurrentLighting", "LogiLedRestoreLighting",
-		"LogiLedShutdown", "LogiLedGetSdkVersion",
-		"LogiLedSetLightingForKeyWithKeyName",
-		"LogiLedSetLightingForKeyWithScanCode",
-		"LogiLedSetLightingForKeyWithHidCode",
-		"LogiLedSetLightingForTargetZone",
-		"LogiLedGetConfigOptionNumber",
-		// Steering wheel SDK functions (maybe bundled?)
-		"LogiSteeringInitialize", "LogiPlayLeds",
-		"LogiIsConnected", "LogiUpdate",
-		NULL
-	};
-
-	Log("  Exported functions:");
-	for (int i = 0; probeNames[i]; i++)
+	// Enumerate ALL exports from the DLL using PE export table
+	Log("  --- ALL DLL EXPORTS ---");
+	BYTE* base = (BYTE*)m_sdkDll;
+	IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+	if (dos->e_magic == IMAGE_DOS_SIGNATURE)
 	{
-		FARPROC p = GetProcAddress(m_sdkDll, probeNames[i]);
-		if (p) Log("    %s: FOUND", probeNames[i]);
+		IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+		if (nt->Signature == IMAGE_NT_SIGNATURE)
+		{
+			DWORD expRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+			if (expRVA)
+			{
+				IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)(base + expRVA);
+				DWORD* names = (DWORD*)(base + exp->AddressOfNames);
+				for (DWORD i = 0; i < exp->NumberOfNames; i++)
+					Log("    [%02lu] %s", i, (char*)(base + names[i]));
+			}
+		}
 	}
+	Log("  --- END EXPORTS ---");
 
-	// Get function pointers
 	g_LedInit       = (LogiLedInit_t)GetProcAddress(m_sdkDll, "LogiLedInit");
-	g_LedInitWithName = (LogiLedInitWithName_t)GetProcAddress(m_sdkDll, "LogiLedInitWithName");
 	g_LedSetTarget  = (LogiLedSetTargetDevice_t)GetProcAddress(m_sdkDll, "LogiLedSetTargetDevice");
 	g_LedSetLighting = (LogiLedSetLighting_t)GetProcAddress(m_sdkDll, "LogiLedSetLighting");
 	g_LedShutdown   = (LogiLedShutdown_t)GetProcAddress(m_sdkDll, "LogiLedShutdown");
 	g_LedGetVersion = (LogiLedGetSdkVersion_t)GetProcAddress(m_sdkDll, "LogiLedGetSdkVersion");
 
-	// SDK version
 	if (g_LedGetVersion)
 	{
 		int major = 0, minor = 0, build = 0;
@@ -366,10 +360,8 @@ bool LogitechLED::TrySDK()
 			Log("  SDK version: %d.%d.%d", major, minor, build);
 	}
 
-	// Init
 	if (!g_LedInit)
 	{
-		Log("  LogiLedInit not found");
 		FreeLibrary(m_sdkDll);
 		m_sdkDll = NULL;
 		return false;
@@ -377,77 +369,61 @@ bool LogitechLED::TrySDK()
 
 	bool ok = g_LedInit();
 	Log("  LogiLedInit() -> %s", ok ? "OK" : "FAIL");
-
 	if (!ok)
 	{
-		Log("  Is G Hub running?");
 		FreeLibrary(m_sdkDll);
 		m_sdkDll = NULL;
 		return false;
 	}
 
-	// Give G Hub a moment to enumerate devices
 	Sleep(500);
 
-	// Try setting lighting on all device types
-	if (g_LedSetTarget)
+	// Exhaustive scan: try many device type + zone combinations
+	FARPROC pZone = GetProcAddress(m_sdkDll, "LogiLedSetLightingForTargetZone");
+	if (pZone && g_LedSetTarget)
 	{
-		// LOGI_DEVICETYPE_MONOCHROME=1, RGB=2, PERKEY_RGB=4, ALL=7
-		g_LedSetTarget(0x07);  // target ALL devices
-		Log("  SetTargetDevice(ALL)");
-	}
+		typedef bool (*SetZone_t)(int, int, int, int, int);
+		SetZone_t setZone = (SetZone_t)pZone;
 
-	if (g_LedSetLighting)
-	{
-		// Try full brightness
-		bool led = g_LedSetLighting(100, 100, 100);
-		Log("  SetLighting(100,100,100) -> %s *** LOOK AT WHEEL ***", led ? "OK" : "FAIL");
+		// Try device types: known bitmasks + higher values + 0xFF
+		int deviceTypes[] = { 0x01, 0x02, 0x04, 0x07, 0x08, 0x10, 0x20,
+		                      0x40, 0x80, 0xFF, 0x0100, 0x0200, -1 };
 
-		Sleep(1000);
-
-		// Try just green (RPM LEDs are green at low RPM)
-		led = g_LedSetLighting(0, 100, 0);
-		Log("  SetLighting(0,100,0) -> %s", led ? "OK" : "FAIL");
-
-		Sleep(1000);
-
-		// Try red (RPM LEDs are red at high RPM)
-		led = g_LedSetLighting(100, 0, 0);
-		Log("  SetLighting(100,0,0) -> %s", led ? "OK" : "FAIL");
-
-		Sleep(1000);
-
-		// Try monochrome target specifically
-		if (g_LedSetTarget)
+		for (int di = 0; deviceTypes[di] != -1; di++)
 		{
-			g_LedSetTarget(0x01);  // MONOCHROME only
-			led = g_LedSetLighting(100, 100, 100);
-			Log("  SetTargetDevice(MONO) + SetLighting(100,100,100) -> %s", led ? "OK" : "FAIL");
-			Sleep(1000);
+			g_LedSetTarget(deviceTypes[di]);
+			for (int zone = 0; zone < 10; zone++)
+			{
+				bool zok = setZone(deviceTypes[di], zone, 100, 100, 100);
+				if (zok)
+				{
+					Log("  *** HIT *** SetZone(devType=0x%X, zone=%d) -> OK", deviceTypes[di], zone);
+					Sleep(500);
+				}
+			}
 		}
 
-		// Check if there's a zone-based function
-		FARPROC pZone = GetProcAddress(m_sdkDll, "LogiLedSetLightingForTargetZone");
-		if (pZone)
+		// Also try SetZone with ordinal device types (0, 1, 2, 3, 4, 5)
+		for (int dt = 0; dt <= 5; dt++)
 		{
-			typedef bool (*SetZone_t)(int, int, int, int, int);
-			SetZone_t setZone = (SetZone_t)pZone;
-
-			// deviceType=ALL, zone=0..4, R=100, G=100, B=100
-			for (int zone = 0; zone < 6; zone++)
+			for (int zone = 0; zone < 10; zone++)
 			{
-				bool zled = setZone(0x07, zone, 100, 100, 100);
-				Log("  SetLightingForTargetZone(ALL,%d,100,100,100) -> %s", zone, zled ? "OK" : "FAIL");
-				Sleep(500);
+				bool zok = setZone(dt, zone, 100, 100, 100);
+				if (zok)
+					Log("  *** HIT *** SetZone(ordinal=%d, zone=%d) -> OK", dt, zone);
 			}
 		}
 	}
 
-	Log("  SDK init complete - check if any LEDs responded");
-
-	m_method = METHOD_SDK;
-	m_available = true;
-	return true;
+	// Don't activate LED SDK - it doesn't control wheel LEDs
+	Log("  LED SDK scan complete (keyboard/mouse only)");
+	if (g_LedShutdown) g_LedShutdown();
+	FreeLibrary(m_sdkDll);
+	m_sdkDll = NULL;
+	g_LedInit = NULL;
+	g_LedSetLighting = NULL;
+	g_LedShutdown = NULL;
+	return false;
 }
 
 // --- I/O helpers ---
@@ -647,48 +623,29 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v5 ===");
+	Log("=== LogitechLED Init v6 ===");
 	Log("");
 
 	if (m_available) return true;
 
-	// Phase 0: Steering Wheel SDK (LogiPlayLeds - standard for racing games)
+	// Phase 0: Steering Wheel SDK (LogiPlayLeds)
 	if (TrySteeringSDK())
 		return true;
 
-	// Phase 1: G Hub LED SDK (keyboard/mouse - fallback)
+	// Phase 1: G Hub LED SDK (diagnostic - enumerate exports, scan zones)
 	Log("");
-	if (TrySDK())
-		return true;
+	TrySDK();  // always returns false now, just diagnostic
 
-	// Phase 2: HID++ enumeration (diagnostic only - kernel drivers block)
+	// Phase 2: HID enumeration + Legacy attempt
 	Log("");
-	Log("=== Phase 2: HID++ enumeration ===");
+	Log("=== Phase 2: HID collections ===");
 
 	HIDCandidate candidates[MAX_CANDIDATES];
 	int numCandidates = 0;
 	EnumerateCandidates(candidates, &numCandidates);
 	Log("  %d writable collections", numCandidates);
 
-	for (int ci = 0; ci < numCandidates; ci++)
-	{
-		if (candidates[ci].usagePage != 0xFF43) continue;
-		if (candidates[ci].inputReportLen == 0) continue;
-		if (candidates[ci].outputReportLen < 64) continue;
-
-		HANDLE h = CreateFileA(candidates[ci].path,
-			GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-			NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-		if (h == INVALID_HANDLE_VALUE) continue;
-
-		TryHIDPPDiscovery(h, candidates[ci].outputReportLen, candidates[ci].inputReportLen);
-		CloseHandle(h);
-	}
-
-	// Phase 3: Legacy fallback
-	Log("");
-	Log("=== Phase 3: Legacy ===");
-
+	// Try legacy on ALL writable collections (not just UP=0xFF43)
 	for (int ci = 0; ci < numCandidates; ci++)
 	{
 		HANDLE h = CreateFileA(candidates[ci].path,
@@ -696,6 +653,7 @@ bool LogitechLED::Init()
 			NULL, OPEN_EXISTING, 0, NULL);
 		if (h == INVALID_HANDLE_VALUE) continue;
 
+		// Try legacy [F8 12] on every collection
 		if (TryLegacy(h, candidates[ci].outputReportLen))
 		{
 			m_handle = h;
@@ -709,6 +667,8 @@ bool LogitechLED::Init()
 
 	Log("");
 	Log("=== NO WORKING METHOD ===");
+	Log("G Hub kernel drivers block HID LED commands.");
+	Log("Try: taskkill /f /im lghub_agent.exe  (then relaunch game)");
 	return false;
 }
 
