@@ -44,16 +44,19 @@ static bool IsKnownPID(USHORT pid)
 // --- Steering Wheel SDK function pointers ---
 
 typedef bool (__cdecl *LogiSteeringInit_t)(bool);
+typedef bool (__cdecl *LogiSteeringInitWithWindow_t)(bool, HWND);
 typedef bool (__cdecl *LogiUpdate_t)();
 typedef bool (__cdecl *LogiIsConnected_t)(int);
 typedef bool (__cdecl *LogiPlayLeds_t)(int, float, float, float);
 typedef void (__cdecl *LogiSteeringShutdown_t)();
 
-static LogiSteeringInit_t      g_SteeringInit = NULL;
-static LogiUpdate_t            g_SteeringUpdate = NULL;
-static LogiIsConnected_t       g_IsConnected = NULL;
-static LogiPlayLeds_t          g_PlayLeds = NULL;
-static LogiSteeringShutdown_t  g_SteeringShutdown = NULL;
+static LogiSteeringInit_t            g_SteeringInit = NULL;
+static LogiSteeringInitWithWindow_t  g_SteeringInitWithWindow = NULL;
+static LogiUpdate_t                  g_SteeringUpdate = NULL;
+static LogiIsConnected_t             g_IsConnected = NULL;
+static LogiPlayLeds_t                g_PlayLeds = NULL;
+static LogiSteeringShutdown_t        g_SteeringShutdown = NULL;
+static bool                          g_SteeringNeedsLateInit = false;
 
 // --- G Hub LED SDK function pointers ---
 
@@ -125,10 +128,12 @@ void LogitechLED::Close()
 	m_available = false;
 	m_method = METHOD_NONE;
 	g_SteeringInit = NULL;
+	g_SteeringInitWithWindow = NULL;
 	g_SteeringUpdate = NULL;
 	g_IsConnected = NULL;
 	g_PlayLeds = NULL;
 	g_SteeringShutdown = NULL;
+	g_SteeringNeedsLateInit = false;
 	g_LedInit = NULL;
 	g_LedSetLighting = NULL;
 	g_LedShutdown = NULL;
@@ -200,13 +205,18 @@ bool LogitechLED::TrySteeringSDK()
 	for (int i = 0; shutNames[i] && !g_SteeringShutdown; i++)
 		g_SteeringShutdown = (LogiSteeringShutdown_t)GetProcAddress(m_steeringDll, shutNames[i]);
 
+	// Also try InitWithWindow variant
+	g_SteeringInitWithWindow = (LogiSteeringInitWithWindow_t)
+		GetProcAddress(m_steeringDll, "LogiSteeringInitializeWithWindow");
+
 	Log("  LogiSteeringInitialize: %s", g_SteeringInit ? "FOUND" : "NOT FOUND");
+	Log("  LogiSteeringInitializeWithWindow: %s", g_SteeringInitWithWindow ? "FOUND" : "NOT FOUND");
 	Log("  LogiUpdate: %s", g_SteeringUpdate ? "FOUND" : "NOT FOUND");
 	Log("  LogiIsConnected: %s", g_IsConnected ? "FOUND" : "NOT FOUND");
 	Log("  LogiPlayLeds: %s", g_PlayLeds ? "FOUND" : "NOT FOUND");
 	Log("  LogiSteeringShutdown: %s", g_SteeringShutdown ? "FOUND" : "NOT FOUND");
 
-	if (!g_SteeringInit || !g_SteeringUpdate || !g_IsConnected || !g_PlayLeds)
+	if (!g_SteeringUpdate || !g_IsConnected || !g_PlayLeds)
 	{
 		Log("  Required functions missing");
 		FreeLibrary(m_steeringDll);
@@ -214,67 +224,84 @@ bool LogitechLED::TrySteeringSDK()
 		return false;
 	}
 
-	// Initialize - ignoreXInputControllers=false so we see Xbox wheels
-	bool ok = g_SteeringInit(false);
-	Log("  LogiSteeringInitialize(false) -> %s", ok ? "OK" : "FAIL");
-
-	if (!ok)
+	if (!g_SteeringInit && !g_SteeringInitWithWindow)
 	{
-		Log("  Init failed. Is G Hub running?");
+		Log("  No init function found");
 		FreeLibrary(m_steeringDll);
 		m_steeringDll = NULL;
 		return false;
 	}
 
-	// CRITICAL: Must call LogiUpdate() multiple times for G Hub to enumerate
-	// devices. Without this, LogiIsConnected() always returns false.
-	for (int retry = 0; retry < 10; retry++)
-	{
-		Sleep(200);
-		g_SteeringUpdate();
+	// Try immediate init with multiple approaches
+	bool ok = false;
 
-		if (g_IsConnected(0))
+	// Attempt 1: InitWithWindow + GetDesktopWindow (always available)
+	if (!ok && g_SteeringInitWithWindow)
+	{
+		HWND desktop = GetDesktopWindow();
+		ok = g_SteeringInitWithWindow(false, desktop);
+		Log("  InitWithWindow(false, desktop=0x%p) -> %s", desktop, ok ? "OK" : "FAIL");
+	}
+
+	// Attempt 2: InitWithWindow + GetForegroundWindow
+	if (!ok && g_SteeringInitWithWindow)
+	{
+		HWND fg = GetForegroundWindow();
+		if (fg)
 		{
-			Log("  Wheel connected at index 0 (after %d updates)", retry + 1);
-			break;
+			ok = g_SteeringInitWithWindow(false, fg);
+			Log("  InitWithWindow(false, foreground=0x%p) -> %s", fg, ok ? "OK" : "FAIL");
 		}
 	}
 
-	bool connected = g_IsConnected(0);
-	Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
-
-	if (!connected)
+	// Attempt 3: Simple init (no window)
+	if (!ok && g_SteeringInit)
 	{
-		// Try index 1
-		connected = g_IsConnected(1);
-		Log("  LogiIsConnected(1) -> %s", connected ? "YES" : "NO");
+		ok = g_SteeringInit(false);
+		Log("  LogiSteeringInitialize(false) -> %s", ok ? "OK" : "FAIL");
 	}
 
-	if (!connected)
+	if (ok)
 	{
-		Log("  No wheel detected by SDK. Trying LogiPlayLeds anyway...");
+		// Init succeeded now - enumerate and test
+		Log("  Init succeeded, enumerating...");
+
+		for (int retry = 0; retry < 10; retry++)
+		{
+			Sleep(200);
+			g_SteeringUpdate();
+			if (g_IsConnected(0))
+			{
+				Log("  Wheel connected at index 0 (after %d updates)", retry + 1);
+				break;
+			}
+		}
+
+		bool connected = g_IsConnected(0);
+		Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
+
+		// Test LEDs
+		g_SteeringUpdate();
+		bool led = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
+		Log("  LogiPlayLeds(0, 100, 0, 100) -> %s *** ALL LEDs ***", led ? "OK" : "FAIL");
+		Sleep(1000);
+
+		g_SteeringUpdate();
+		g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
+
+		m_method = METHOD_STEERING_SDK;
+		m_available = true;
+		Log("=== LED CONTROL ACTIVE (Steering Wheel SDK) ===");
+		return true;
 	}
 
-	// Test LEDs - all on (redline)
-	g_SteeringUpdate();
-	bool led = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
-	Log("  LogiPlayLeds(0, 100, 0, 100) -> %s *** ALL LEDs ON ***", led ? "OK" : "FAIL");
-	Sleep(1000);
-
-	// Test LEDs - half
-	g_SteeringUpdate();
-	led = g_PlayLeds(0, 50.0f, 0.0f, 100.0f);
-	Log("  LogiPlayLeds(0, 50, 0, 100) -> %s *** HALF LEDs ***", led ? "OK" : "FAIL");
-	Sleep(1000);
-
-	// Test LEDs - off
-	g_SteeringUpdate();
-	led = g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
-	Log("  LogiPlayLeds(0, 0, 0, 100) -> %s *** LEDs OFF ***", led ? "OK" : "FAIL");
-
+	// All immediate inits failed - defer to first SetLEDs call
+	// (game window will exist by then)
+	Log("  Immediate init failed - deferring to first SetLEDs call");
+	g_SteeringNeedsLateInit = true;
 	m_method = METHOD_STEERING_SDK;
 	m_available = true;
-	Log("=== LED CONTROL ACTIVE (Steering Wheel SDK) ===");
+	Log("=== LED CONTROL PENDING (Steering Wheel SDK - deferred init) ===");
 	return true;
 }
 
@@ -695,21 +722,11 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 
 	if (m_method == METHOD_STEERING_SDK && g_PlayLeds && g_SteeringUpdate)
 	{
-		// Map 5-bit LED mask to RPM percentage for LogiPlayLeds
+		// Delegate to SetLEDsFromPercent which handles deferred init
 		int numLeds = 0;
 		for (int i = 0; i < 5; i++)
 			if (ledMask & (1 << i)) numLeds++;
-
-		float rpm = numLeds * 20.0f;  // 0-100
-		g_SteeringUpdate();
-		bool ok = g_PlayLeds(0, rpm, 0.0f, 100.0f);
-
-		g_setLedsCallCount++;
-		if (g_setLedsCallCount <= 20 || !ok)
-			Log("SetLEDs(0x%02X) [SteeringSDK rpm=%.0f] -> %s (#%d)",
-				ledMask, rpm, ok ? "OK" : "FAIL", g_setLedsCallCount);
-
-		return ok;
+		return SetLEDsFromPercent(numLeds / 5.0);
 	}
 
 	if (m_method == METHOD_SDK && g_LedSetLighting)
@@ -775,6 +792,47 @@ bool LogitechLED::SetLEDsFromPercent(double percent)
 	// For steering SDK, pass percentage directly as RPM for smooth LED progression
 	if (m_method == METHOD_STEERING_SDK && g_PlayLeds && g_SteeringUpdate)
 	{
+		// Deferred init: game window exists now
+		if (g_SteeringNeedsLateInit)
+		{
+			g_SteeringNeedsLateInit = false;
+			bool ok = false;
+
+			HWND fg = GetForegroundWindow();
+			if (fg && g_SteeringInitWithWindow)
+			{
+				ok = g_SteeringInitWithWindow(false, fg);
+				Log("  LATE InitWithWindow(false, hwnd=0x%p) -> %s", fg, ok ? "OK" : "FAIL");
+			}
+			if (!ok && g_SteeringInit)
+			{
+				ok = g_SteeringInit(false);
+				Log("  LATE LogiSteeringInitialize(false) -> %s", ok ? "OK" : "FAIL");
+			}
+
+			if (ok)
+			{
+				for (int retry = 0; retry < 10; retry++)
+				{
+					Sleep(200);
+					g_SteeringUpdate();
+					if (g_IsConnected(0))
+					{
+						Log("  LATE: Wheel connected (after %d updates)", retry + 1);
+						break;
+					}
+				}
+				Log("  LATE: LogiIsConnected(0) -> %s", g_IsConnected(0) ? "YES" : "NO");
+			}
+			else
+			{
+				Log("  LATE init also failed - steering SDK unavailable");
+				m_method = METHOD_NONE;
+				m_available = false;
+				return false;
+			}
+		}
+
 		float rpm = (float)(percent * 100.0);
 		g_SteeringUpdate();
 		bool ok = g_PlayLeds(0, rpm, 0.0f, 100.0f);
