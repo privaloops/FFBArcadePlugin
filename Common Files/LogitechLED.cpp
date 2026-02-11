@@ -888,34 +888,46 @@ bool LogitechLED::TrySteeringSDK()
 		}
 	}
 
-	// --- Fallback C: DInput device via bypass ---
+	// --- Fallback C: DInput via REAL system dinput8.dll ---
+	// Previous versions used GetModuleHandleA("dinput8.dll") which returns
+	// OUR wrapper DLL (since we ARE dinput8.dll). That broke enumeration.
 	if (g_PlayLedsDInput)
 	{
-		Log("  Fallback C: Real DInput device (bypass mode)...");
-		g_bypassDIWrapper = true;
+		Log("  Fallback C: Loading real system dinput8.dll...");
+
+		char sysDir[MAX_PATH];
+		GetSystemDirectoryA(sysDir, MAX_PATH);
+		strcat_s(sysDir, MAX_PATH, "\\dinput8.dll");
+		HMODULE hSysDI8 = LoadLibraryA(sysDir);
+		Log("  System DLL: %s -> 0x%p", sysDir, hSysDI8);
 
 		typedef HRESULT (WINAPI *DI8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-		DI8Create_t realCreate = (DI8Create_t)GetProcAddress(
-			GetModuleHandleA("dinput8.dll"), "DirectInput8Create");
+		DI8Create_t realCreate = hSysDI8 ?
+			(DI8Create_t)GetProcAddress(hSysDI8, "DirectInput8Create") : NULL;
 
 		if (realCreate)
 		{
 			HRESULT hr = realCreate(GetModuleHandle(NULL), DIRECTINPUT_VERSION,
 				IID_IDirectInput8A, (LPVOID*)&g_realDI, NULL);
-			Log("  DirectInput8Create (bypass) -> 0x%08lX, DI=0x%p", hr, g_realDI);
+			Log("  DirectInput8Create -> 0x%08lX, DI=0x%p", hr, g_realDI);
 
 			if (SUCCEEDED(hr) && g_realDI)
 			{
 				EnumWheelCtx enumCtx;
 				memset(&enumCtx, 0, sizeof(enumCtx));
 
-				g_realDI->EnumDevices(DI8DEVCLASS_GAMECTRL,
+				HRESULT hrE = g_realDI->EnumDevices(DI8DEVCLASS_GAMECTRL,
 					EnumWheelCB, &enumCtx, DIEDFL_ATTACHEDONLY);
+				Log("  EnumDevices(GAMECTRL, ATTACHED) -> 0x%08lX found=%s",
+					hrE, enumCtx.found ? "yes" : "no");
 
 				if (!enumCtx.found)
 				{
 					memset(&enumCtx, 0, sizeof(enumCtx));
-					g_realDI->EnumDevices(0, EnumWheelCB, &enumCtx, DIEDFL_ALLDEVICES);
+					hrE = g_realDI->EnumDevices(0,
+						EnumWheelCB, &enumCtx, DIEDFL_ATTACHEDONLY);
+					Log("  EnumDevices(ALL, ATTACHED) -> 0x%08lX found=%s",
+						hrE, enumCtx.found ? "yes" : "no");
 				}
 
 				if (enumCtx.found)
@@ -931,13 +943,12 @@ bool LogitechLED::TrySteeringSDK()
 
 						if (led)
 						{
-							Sleep(1000);
+							Sleep(2000);
 							g_SteeringUpdate();
 							g_PlayLedsDInput(g_realDIDevice, 0.0f, 0.0f, 100.0f);
 							m_method = METHOD_STEERING_SDK;
 							m_available = true;
-							g_bypassDIWrapper = false;
-							Log("=== LED CONTROL ACTIVE (direct engine + DInput) ===");
+							Log("=== LED CONTROL ACTIVE (engine + real DInput) ===");
 							return true;
 						}
 
@@ -946,15 +957,15 @@ bool LogitechLED::TrySteeringSDK()
 					}
 				}
 				else
-				{
-					Log("  No Logitech wheel via DInput");
-				}
+					Log("  No Logitech wheel found in ANY DInput enumeration");
 
 				g_realDI->Release();
 				g_realDI = NULL;
 			}
 		}
-		g_bypassDIWrapper = false;
+		else
+			Log("  Could not load system dinput8.dll");
+		// Don't FreeLibrary(hSysDI8) - may be referenced by DI internals
 	}
 
 	Log("  All methods exhausted");
@@ -1354,7 +1365,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v15 (fix parsing + HID++ via WS) ===");
+	Log("=== LogitechLED Init v16 (real system DInput fix) ===");
 	Log("");
 
 	if (m_available) return true;
