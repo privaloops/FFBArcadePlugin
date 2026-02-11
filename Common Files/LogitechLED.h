@@ -51,6 +51,7 @@ private:
 	void EnumerateCandidates(HIDCandidate* out, int* count);
 	bool SendReport(HANDLE h, const BYTE* report, USHORT len);
 	bool ReadReport(HANDLE h, BYTE* report, USHORT len, DWORD timeoutMs);
+	bool TryGHubWebSocket();
 	bool TrySteeringSDK();
 	bool TrySDK();
 	bool TryHIDPPDiscovery(HANDLE h, USHORT outLen, USHORT inLen);
