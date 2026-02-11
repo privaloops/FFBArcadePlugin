@@ -69,6 +69,7 @@ typedef bool (*LogiLedRestoreLighting_t)();
 typedef void (*LogiLedShutdown_t)();
 typedef bool (*LogiLedGetSdkVersion_t)(int*, int*, int*);
 typedef bool (*LogiLedSetLightingForKeyWithKeyName_t)(int, int, int, int);
+typedef bool (*LogiLedSetZone_t)(int, int, int, int, int);
 
 static LogiLedInit_t                     g_LedInit = NULL;
 static LogiLedInitWithName_t             g_LedInitWithName = NULL;
@@ -78,6 +79,7 @@ static LogiLedSaveCurrentLighting_t      g_LedSave = NULL;
 static LogiLedRestoreLighting_t          g_LedRestore = NULL;
 static LogiLedShutdown_t                 g_LedShutdown = NULL;
 static LogiLedGetSdkVersion_t            g_LedGetVersion = NULL;
+static LogiLedSetZone_t                  g_LedSetZone = NULL;
 
 // --- LogitechLED ---
 
@@ -137,6 +139,7 @@ void LogitechLED::Close()
 	g_LedInit = NULL;
 	g_LedSetLighting = NULL;
 	g_LedShutdown = NULL;
+	g_LedSetZone = NULL;
 }
 
 bool LogitechLED::IsAvailable() const
@@ -432,51 +435,44 @@ bool LogitechLED::TrySDK()
 
 	Sleep(500);
 
-	// Exhaustive scan: try many device type + zone combinations
-	FARPROC pZone = GetProcAddress(m_sdkDll, "LogiLedSetLightingForTargetZone");
-	if (pZone && g_LedSetTarget)
+	g_LedSetZone = (LogiLedSetZone_t)GetProcAddress(m_sdkDll, "LogiLedSetLightingForTargetZone");
+
+	if (g_LedSetZone && g_LedSetTarget)
 	{
-		typedef bool (*SetZone_t)(int, int, int, int, int);
-		SetZone_t setZone = (SetZone_t)pZone;
+		// Target device type 0x8 (responded OK in previous tests)
+		g_LedSetTarget(0x8);
 
-		// Try device types: known bitmasks + higher values + 0xFF
-		int deviceTypes[] = { 0x01, 0x02, 0x04, 0x07, 0x08, 0x10, 0x20,
-		                      0x40, 0x80, 0xFF, 0x0100, 0x0200, -1 };
+		// Test: light up zone 0 and 1 with bright green (RPM LED color)
+		bool z0 = g_LedSetZone(0x8, 0, 0, 100, 0);
+		bool z1 = g_LedSetZone(0x8, 1, 0, 100, 0);
+		Log("  devType=0x8 zone0(green) -> %s, zone1(green) -> %s", z0 ? "OK" : "FAIL", z1 ? "OK" : "FAIL");
 
-		for (int di = 0; deviceTypes[di] != -1; di++)
+		if (z0 || z1)
 		{
-			g_LedSetTarget(deviceTypes[di]);
-			for (int zone = 0; zone < 10; zone++)
-			{
-				bool zok = setZone(deviceTypes[di], zone, 100, 100, 100);
-				if (zok)
-				{
-					Log("  *** HIT *** SetZone(devType=0x%X, zone=%d) -> OK", deviceTypes[di], zone);
-					Sleep(500);
-				}
-			}
-		}
+			Log("  *** Activating LED SDK with devType=0x8 ***");
+			Log("  Waiting 2s to check if LEDs are visible...");
+			Sleep(2000);
 
-		// Also try SetZone with ordinal device types (0, 1, 2, 3, 4, 5)
-		for (int dt = 0; dt <= 5; dt++)
-		{
-			for (int zone = 0; zone < 10; zone++)
-			{
-				bool zok = setZone(dt, zone, 100, 100, 100);
-				if (zok)
-					Log("  *** HIT *** SetZone(ordinal=%d, zone=%d) -> OK", dt, zone);
-			}
+			// Clear
+			g_LedSetZone(0x8, 0, 0, 0, 0);
+			g_LedSetZone(0x8, 1, 0, 0, 0);
+
+			m_method = METHOD_SDK;
+			m_available = true;
+			Log("=== LED CONTROL ACTIVE (LED SDK devType=0x8) ===");
+			return true;
 		}
 	}
 
-	// Don't activate LED SDK - it doesn't control wheel LEDs
-	Log("  LED SDK scan complete (keyboard/mouse only)");
+	// devType=0x8 didn't work, clean up
+	Log("  LED SDK: no usable zones found");
 	if (g_LedShutdown) g_LedShutdown();
 	FreeLibrary(m_sdkDll);
 	m_sdkDll = NULL;
 	g_LedInit = NULL;
 	g_LedSetLighting = NULL;
 	g_LedShutdown = NULL;
+	g_LedSetZone = NULL;
 	return false;
 }
 
@@ -743,21 +739,34 @@ bool LogitechLED::SetLEDs(BYTE ledMask)
 		return SetLEDsFromPercent(numLeds / 5.0);
 	}
 
-	if (m_method == METHOD_SDK && g_LedSetLighting)
+	if (m_method == METHOD_SDK && g_LedSetZone)
 	{
+		// Map 5-bit LED mask to devType=0x8 zones 0-1
+		// Zone 0 = lower LEDs (green), Zone 1 = upper LEDs (red)
 		int numLeds = 0;
 		for (int i = 0; i < 5; i++)
 			if (ledMask & (1 << i)) numLeds++;
 
-		int pct = numLeds * 20;
-		bool ok = g_LedSetLighting(pct, pct, pct);
+		// Zone 0: green intensity based on LED count (first 3 LEDs)
+		// Zone 1: red intensity for high RPM (last 2 LEDs)
+		int greenPct = 0, redPct = 0;
+		if (numLeds >= 1) greenPct = 33;
+		if (numLeds >= 2) greenPct = 66;
+		if (numLeds >= 3) greenPct = 100;
+		if (numLeds >= 4) redPct = 50;
+		if (numLeds >= 5) redPct = 100;
+
+		g_LedSetTarget(0x8);
+		bool z0 = g_LedSetZone(0x8, 0, 0, greenPct, 0);
+		bool z1 = g_LedSetZone(0x8, 1, redPct, 0, 0);
 
 		g_setLedsCallCount++;
-		if (g_setLedsCallCount <= 20 || !ok)
-			Log("SetLEDs(0x%02X) [LedSDK pct=%d] -> %s (#%d)",
-				ledMask, pct, ok ? "OK" : "FAIL", g_setLedsCallCount);
+		if (g_setLedsCallCount <= 20 || (!z0 && !z1))
+			Log("SetLEDs(0x%02X) [SDK 0x8 g=%d r=%d] -> z0=%s z1=%s (#%d)",
+				ledMask, greenPct, redPct,
+				z0 ? "OK" : "FAIL", z1 ? "OK" : "FAIL", g_setLedsCallCount);
 
-		return ok;
+		return z0 || z1;
 	}
 
 	if (m_handle == INVALID_HANDLE_VALUE) return false;
