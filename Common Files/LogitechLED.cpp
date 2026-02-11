@@ -344,37 +344,50 @@ bool LogitechLED::TryGHubWebSocket()
 	{
 		Log("  /devices/list -> %lu bytes", bytesRead);
 
-		// Find STEERING_WHEEL device - search for "deviceType":"STEERING_WHEEL"
-		// then look backwards for the nearest "id":"devXXXX"
-		const char* swType = strstr(buf, "\"deviceType\":\"STEERING_WHEEL\"");
-		if (swType)
+		// Debug: dump JSON start to see actual formatting
+		Log("  JSON[0..300]: %.300s", buf);
+
+		// Fix: search for plain "STEERING_WHEEL" (G Hub JSON has spaces after colons)
+		const char* swPos = strstr(buf, "STEERING_WHEEL");
+		if (swPos)
 		{
-			// Search backwards from swType for "id":"dev
-			const char* search = swType;
-			const char* lastDevId = NULL;
-			// Scan from beginning to swType, remember last "id":"dev match
+			Log("  STEERING_WHEEL at offset %d", (int)(swPos - buf));
+
+			// Search backwards for device ID pattern "dev0..."
 			const char* p = buf;
-			while (p < swType)
+			const char* lastDev = NULL;
+			while (p < swPos)
 			{
-				const char* found = strstr(p, "\"id\":\"dev");
-				if (found && found < swType)
+				const char* found = strstr(p, "\"dev0");
+				if (found && found < swPos)
 				{
-					lastDevId = found;
-					p = found + 9;
+					lastDev = found + 1; // skip opening quote
+					p = found + 5;
 				}
 				else break;
 			}
 
-			if (lastDevId)
+			if (lastDev)
 			{
-				JsonGetString(lastDevId, "id", g_ghubDeviceId, sizeof(g_ghubDeviceId));
+				int i = 0;
+				while (lastDev[i] && lastDev[i] != '"' && i < 63)
+				{
+					g_ghubDeviceId[i] = lastDev[i];
+					i++;
+				}
+				g_ghubDeviceId[i] = 0;
 				Log("  Found steering wheel: %s", g_ghubDeviceId);
 			}
 			else
-				Log("  STEERING_WHEEL found but couldn't find deviceId");
+				Log("  STEERING_WHEEL found but no device ID nearby");
+
+			// Dump context around STEERING_WHEEL
+			int ctxStart = (int)(swPos - buf);
+			if (ctxStart > 200) ctxStart -= 200; else ctxStart = 0;
+			Log("  Context: %.400s", buf + ctxStart);
 		}
 		else
-			Log("  No STEERING_WHEEL in device list");
+			Log("  No STEERING_WHEEL in %lu bytes", bytesRead);
 	}
 	else
 		Log("  No response to /devices/list");
@@ -390,21 +403,7 @@ bool LogitechLED::TryGHubWebSocket()
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 		Log("  Register: %.300s", buf);
 
-	// --- Step 3: Activate with ACTION first (known to work, gets us a GUID) ---
-	snprintf(sendBuf, sizeof(sendBuf),
-		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"ACTION\"}}", msgId++);
-	WS_Send(hWS, sendBuf);
-	Sleep(500);
-	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-	{
-		Log("  Activate ACTION: %.300s", buf);
-		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-		if (g_ghubIntegrationGuid[0])
-			Log("  integrationGuid: %s", g_ghubIntegrationGuid);
-	}
-
-	// --- Step 3b: Now activate with WHEEL ---
+	// --- Step 3: Activate WHEEL first (ACTION before WHEEL corrupts GUID) ---
 	snprintf(sendBuf, sizeof(sendBuf),
 		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
 		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
@@ -414,85 +413,117 @@ bool LogitechLED::TryGHubWebSocket()
 	{
 		Log("  Activate WHEEL: %.300s", buf);
 		JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
-		if (!g_ghubIntegrationGuid[0])
-			JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-		if (g_ghubInstanceGuid[0])
+		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
+		if (strstr(buf, "SUCCESS"))
 		{
-			Log("  WHEEL instanceGuid: %s", g_ghubInstanceGuid);
 			g_ghubRegistered = true;
+			Log("  WHEEL OK! instance=%s integration=%s",
+				g_ghubInstanceGuid, g_ghubIntegrationGuid);
 		}
-		else if (strstr(buf, "SUCCESS"))
+		else
+			Log("  WHEEL failed, trying ACTION fallback...");
+	}
+
+	// --- Step 3b: ACTION fallback ---
+	if (!g_ghubRegistered)
+	{
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"ACTION\"}}", msgId++);
+		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 		{
-			Log("  WHEEL activated (no GUID in response)");
-			g_ghubRegistered = true;
+			Log("  Activate ACTION: %.200s", buf);
+			if (!g_ghubIntegrationGuid[0])
+				JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
+			if (!g_ghubInstanceGuid[0])
+				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
 		}
 	}
 
-	// --- Step 4: Try LED commands via WebSocket ---
+	// --- Step 4: HID++ LED commands via WebSocket ---
+	// If G Hub can relay HID++ to the wheel, this bypasses the kernel driver
 	if (g_ghubDeviceId[0])
 	{
-		Log("  --- Trying LED commands via WebSocket ---");
+		Log("  --- HID++ LED tests via WebSocket ---");
 
-		// Try various LED endpoints
-		const char* ledPaths[] = {
-			"/api/v1/wheel/leds",
-			"/api/v1/devices/%s/leds",
-			"/api/v1/sdk/wheel/leds",
-			"/api/v1/wheel/rpm",
-			"/api/v1/sdk/wheel/rpm",
-			NULL
-		};
+		// A) HID++ setup: [0x11,0xFF,0x12,0x31,0x00] = feat 0x12, func 3 (enable)
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/hid\","
+			"\"payload\":{\"data\":[17,255,18,49,0]}}", msgId++, g_ghubDeviceId);
+		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+			Log("  HID++ setup -> %.200s", buf);
 
-		for (int i = 0; ledPaths[i]; i++)
-		{
-			char path[256];
-			if (strstr(ledPaths[i], "%s"))
-				snprintf(path, sizeof(path), ledPaths[i], g_ghubDeviceId);
-			else
-				strncpy(path, ledPaths[i], sizeof(path) - 1);
-
-			if (strstr(path, "rpm"))
-			{
-				snprintf(sendBuf, sizeof(sendBuf),
-					"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"%s\","
-					"\"payload\":{\"deviceId\":\"%s\",\"currentRpm\":8000,"
-					"\"rpmMax\":9000,\"rpmRedLine\":8500,"
-					"\"instanceGuid\":\"%s\",\"integrationGuid\":\"%s\"}}",
-					msgId++, path, g_ghubDeviceId,
-					g_ghubInstanceGuid, g_ghubIntegrationGuid);
-			}
-			else
-			{
-				snprintf(sendBuf, sizeof(sendBuf),
-					"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"%s\","
-					"\"payload\":{\"deviceId\":\"%s\",\"leds\":31,"
-					"\"instanceGuid\":\"%s\",\"integrationGuid\":\"%s\"}}",
-					msgId++, path, g_ghubDeviceId,
-					g_ghubInstanceGuid, g_ghubIntegrationGuid);
-			}
-
-			WS_Send(hWS, sendBuf);
-			Sleep(300);
-			if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			{
-				Log("  SET %s -> %.200s", path, buf);
-				// Check if SUCCESS
-				if (strstr(buf, "SUCCESS"))
-					Log("  >>> LED command accepted! Check wheel!");
-			}
-			else
-				Log("  SET %s -> (no response)", path);
-		}
-
-		// Try raw HID++ via WebSocket
+		// B) HID++ LEDs ALL ON: [0x11,0xFF,0x12,0x51,0x00,0x05,0x1F]
 		snprintf(sendBuf, sizeof(sendBuf),
 			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/hid\","
 			"\"payload\":{\"data\":[17,255,18,81,0,5,31]}}", msgId++, g_ghubDeviceId);
 		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+		{
+			Log("  HID++ LEDs -> %.200s", buf);
+			if (strstr(buf, "SUCCESS"))
+			{
+				Log("  >>> HID++ ACCEPTED! CHECK WHEEL LEDs! (3s)");
+				Sleep(3000);
+			}
+		}
+
+		// C) Alternate HID path
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/devices/%s/hid\","
+			"\"payload\":{\"data\":[17,255,18,81,0,5,31]}}", msgId++, g_ghubDeviceId);
+		WS_Send(hWS, sendBuf);
 		Sleep(300);
 		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  HID++ via WS -> %.200s", buf);
+			Log("  HID++ (alt path) -> %.200s", buf);
+
+		// D) WHEEL SDK RPM endpoint (if WHEEL activation succeeded)
+		if (g_ghubInstanceGuid[0])
+		{
+			snprintf(sendBuf, sizeof(sendBuf),
+				"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/sdk/wheel/rpm\","
+				"\"payload\":{\"instanceGuid\":\"%s\",\"deviceId\":\"%s\","
+				"\"currentRpm\":8000,\"rpmMax\":9000,\"rpmRedLine\":8500}}",
+				msgId++, g_ghubInstanceGuid, g_ghubDeviceId);
+			WS_Send(hWS, sendBuf);
+			Sleep(500);
+			if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+			{
+				Log("  WHEEL RPM -> %.200s", buf);
+				if (strstr(buf, "SUCCESS"))
+				{
+					Log("  >>> RPM ACCEPTED! CHECK WHEEL LEDs! (3s)");
+					Sleep(3000);
+				}
+			}
+		}
+
+		// E) Direct LED endpoints
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/wheel/leds\","
+			"\"payload\":{\"deviceId\":\"%s\",\"leds\":31,"
+			"\"instanceGuid\":\"%s\",\"integrationGuid\":\"%s\"}}",
+			msgId++, g_ghubDeviceId, g_ghubInstanceGuid, g_ghubIntegrationGuid);
+		WS_Send(hWS, sendBuf);
+		Sleep(300);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+			Log("  /wheel/leds -> %.200s", buf);
+
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/leds\","
+			"\"payload\":{\"leds\":31}}", msgId++, g_ghubDeviceId);
+		WS_Send(hWS, sendBuf);
+		Sleep(300);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+			Log("  /devices/leds -> %.200s", buf);
 	}
+	else
+		Log("  No deviceId - skipping LED tests");
 
 	// Keep WebSocket open briefly then close
 	WinHttpWebSocketClose(hWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
@@ -500,8 +531,10 @@ bool LogitechLED::TryGHubWebSocket()
 	WinHttpCloseHandle(hConnect);
 	WinHttpCloseHandle(hSession);
 
-	Log("  G Hub registration: %s", g_ghubRegistered ? "OK" : "FAILED");
-	return g_ghubRegistered;
+	Log("  WebSocket done: device=%s registered=%s",
+		g_ghubDeviceId[0] ? g_ghubDeviceId : "none",
+		g_ghubRegistered ? "yes" : "no");
+	return false; // Diagnostic only - other phases handle LED control
 }
 
 // --- Phase 0: Logitech Steering Wheel SDK ---
@@ -1321,7 +1354,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v14 (WebSocket + engine) ===");
+	Log("=== LogitechLED Init v15 (fix parsing + HID++ via WS) ===");
 	Log("");
 
 	if (m_available) return true;
