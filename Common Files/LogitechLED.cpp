@@ -146,56 +146,117 @@ bool LogitechLED::IsAvailable() const
 
 // --- Phase 0: Logitech Steering Wheel SDK ---
 
+// Helper: dump all PE exports from a loaded DLL
+static void DumpExports(HMODULE dll, const char* label)
+{
+	BYTE* base = (BYTE*)dll;
+	IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+	IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+	DWORD expRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+	if (!expRVA) { Log("  %s: no export table", label); return; }
+
+	IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)(base + expRVA);
+	DWORD* names = (DWORD*)(base + exp->AddressOfNames);
+	Log("  --- %s EXPORTS (%lu) ---", label, exp->NumberOfNames);
+	for (DWORD i = 0; i < exp->NumberOfNames; i++)
+		Log("    [%02lu] %s", i, (char*)(base + names[i]));
+	Log("  --- END ---");
+}
+
 bool LogitechLED::TrySteeringSDK()
 {
 	Log("=== Phase 0: Steering Wheel SDK ===");
 
-	// Search paths for LogitechSteeringWheelEnginesWrapper.dll
-	const char* searchPaths[] = {
-		// 1. Same directory as game/DLL (LoadLibrary default search)
-		"LogitechSteeringWheelEnginesWrapper.dll",
-		// 2. Logitech Steering Wheel SDK install (x86)
-		"C:\\Program Files\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x86\\LogitechSteeringWheelEnginesWrapper.dll",
-		"C:\\Program Files (x86)\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x86\\LogitechSteeringWheelEnginesWrapper.dll",
-#ifdef _WIN64
-		// 3. x64 variants
-		"C:\\Program Files\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x64\\LogitechSteeringWheelEnginesWrapper.dll",
-		"C:\\Program Files (x86)\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x64\\LogitechSteeringWheelEnginesWrapper.dll",
-#endif
-		// 4. G Hub directory (unlikely but check)
-		"C:\\Program Files\\LGHUB\\LogitechSteeringWheelEnginesWrapper.dll",
-		"C:\\Program Files\\LGHUB\\sdks\\LogitechSteeringWheelEnginesWrapper.dll",
-		NULL
+	// Search order: G Hub internal SDK first (newer, knows G923), then old SDK
+	struct SDKCandidate {
+		const char* path;
+		const char* label;
 	};
 
-	for (int i = 0; searchPaths[i]; i++)
+	SDKCandidate sdkCandidates[] = {
+		// Priority 1: G Hub's own internal steering wheel SDK (2019+, knows G923)
+#ifdef _WIN64
+		{ "C:\\Program Files\\LGHUB\\sdk_legacy_steering_wheel_x64.dll", "G Hub internal x64" },
+		{ "C:\\Program Files\\LGHUB\\sdks\\sdk_legacy_steering_wheel_x64.dll", "G Hub sdks x64" },
+#else
+		{ "C:\\Program Files\\LGHUB\\sdk_legacy_steering_wheel_x86.dll", "G Hub internal x86" },
+		{ "C:\\Program Files\\LGHUB\\sdks\\sdk_legacy_steering_wheel_x86.dll", "G Hub sdks x86" },
+#endif
+		// Priority 2: Old SDK in game directory or SDK install path
+		{ "LogitechSteeringWheelEnginesWrapper.dll", "game dir" },
+		{ "C:\\Program Files\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x86\\LogitechSteeringWheelEnginesWrapper.dll", "SDK x86" },
+		{ "C:\\Program Files (x86)\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x86\\LogitechSteeringWheelEnginesWrapper.dll", "SDK x86 (wow64)" },
+#ifdef _WIN64
+		{ "C:\\Program Files\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x64\\LogitechSteeringWheelEnginesWrapper.dll", "SDK x64" },
+		{ "C:\\Program Files (x86)\\Logitech\\Logitech Steering Wheel SDK\\Lib\\GameEnginesWrapper\\x64\\LogitechSteeringWheelEnginesWrapper.dll", "SDK x64 (wow64)" },
+#endif
+		{ NULL, NULL }
+	};
+
+	const char* loadedLabel = NULL;
+	for (int i = 0; sdkCandidates[i].path; i++)
 	{
-		m_steeringDll = LoadLibraryA(searchPaths[i]);
+		m_steeringDll = LoadLibraryA(sdkCandidates[i].path);
 		if (m_steeringDll)
 		{
-			Log("  Loaded: %s", searchPaths[i]);
+			Log("  Loaded: %s [%s]", sdkCandidates[i].path, sdkCandidates[i].label);
+			loadedLabel = sdkCandidates[i].label;
 			break;
 		}
 	}
 
 	if (!m_steeringDll)
 	{
-		Log("  DLL not found. Searched:");
-		for (int i = 0; searchPaths[i]; i++)
-			Log("    - %s", searchPaths[i]);
-		Log("  >>> Place LogitechSteeringWheelEnginesWrapper.dll next to the game .exe <<<");
+		Log("  No steering wheel DLL found. Searched:");
+		for (int i = 0; sdkCandidates[i].path; i++)
+			Log("    - %s", sdkCandidates[i].path);
 		return false;
 	}
 
-	// Get function pointers - try plain names first, then mangled
-	const char* initNames[] = { "LogiSteeringInitialize", "_LogiSteeringInitialize", NULL };
-	const char* updateNames[] = { "LogiUpdate", "_LogiUpdate", NULL };
-	const char* connNames[] = { "LogiIsConnected", "_LogiIsConnected", NULL };
-	const char* ledsNames[] = { "LogiPlayLeds", "_LogiPlayLeds", NULL };
-	const char* shutNames[] = { "LogiSteeringShutdown", "_LogiSteeringShutdown", NULL };
+	// Dump ALL exports so we can see what functions exist
+	DumpExports(m_steeringDll, loadedLabel ? loadedLabel : "SteeringSDK");
+
+	// Try many possible function name patterns (G Hub internal DLL may use different names)
+	const char* initNames[] = {
+		"LogiSteeringInitialize", "_LogiSteeringInitialize",
+		"LogiInit", "LogiInitialize",
+		NULL
+	};
+	const char* initWndNames[] = {
+		"LogiSteeringInitializeWithWindow", "_LogiSteeringInitializeWithWindow",
+		"LogiInitWithWindow",
+		NULL
+	};
+	const char* updateNames[] = {
+		"LogiUpdate", "_LogiUpdate",
+		"LogiSteeringUpdate",
+		NULL
+	};
+	const char* connNames[] = {
+		"LogiIsConnected", "_LogiIsConnected",
+		"LogiIsDeviceConnected",
+		NULL
+	};
+	const char* ledsNames[] = {
+		"LogiPlayLeds", "_LogiPlayLeds",
+		"LogiSetLeds", "LogiSetLEDs", "LogiPlayLEDs",
+		"LogiSetRpmLeds", "LogiPlayRpmLeds",
+		NULL
+	};
+	const char* shutNames[] = {
+		"LogiSteeringShutdown", "_LogiSteeringShutdown",
+		"LogiShutdown",
+		NULL
+	};
 
 	for (int i = 0; initNames[i] && !g_SteeringInit; i++)
 		g_SteeringInit = (LogiSteeringInit_t)GetProcAddress(m_steeringDll, initNames[i]);
+	for (int i = 0; initWndNames[i] && !g_SteeringInitWithWindow; i++)
+		g_SteeringInitWithWindow = (LogiSteeringInitWithWindow_t)GetProcAddress(m_steeringDll, initWndNames[i]);
 	for (int i = 0; updateNames[i] && !g_SteeringUpdate; i++)
 		g_SteeringUpdate = (LogiUpdate_t)GetProcAddress(m_steeringDll, updateNames[i]);
 	for (int i = 0; connNames[i] && !g_IsConnected; i++)
@@ -205,20 +266,18 @@ bool LogitechLED::TrySteeringSDK()
 	for (int i = 0; shutNames[i] && !g_SteeringShutdown; i++)
 		g_SteeringShutdown = (LogiSteeringShutdown_t)GetProcAddress(m_steeringDll, shutNames[i]);
 
-	// Also try InitWithWindow variant
-	g_SteeringInitWithWindow = (LogiSteeringInitWithWindow_t)
-		GetProcAddress(m_steeringDll, "LogiSteeringInitializeWithWindow");
-
-	Log("  LogiSteeringInitialize: %s", g_SteeringInit ? "FOUND" : "NOT FOUND");
-	Log("  LogiSteeringInitializeWithWindow: %s", g_SteeringInitWithWindow ? "FOUND" : "NOT FOUND");
-	Log("  LogiUpdate: %s", g_SteeringUpdate ? "FOUND" : "NOT FOUND");
-	Log("  LogiIsConnected: %s", g_IsConnected ? "FOUND" : "NOT FOUND");
-	Log("  LogiPlayLeds: %s", g_PlayLeds ? "FOUND" : "NOT FOUND");
-	Log("  LogiSteeringShutdown: %s", g_SteeringShutdown ? "FOUND" : "NOT FOUND");
+	Log("  Function resolution:");
+	Log("    Init: %s", g_SteeringInit ? "FOUND" : "not found");
+	Log("    InitWithWindow: %s", g_SteeringInitWithWindow ? "FOUND" : "not found");
+	Log("    Update: %s", g_SteeringUpdate ? "FOUND" : "not found");
+	Log("    IsConnected: %s", g_IsConnected ? "FOUND" : "not found");
+	Log("    PlayLeds: %s", g_PlayLeds ? "FOUND" : "not found");
+	Log("    Shutdown: %s", g_SteeringShutdown ? "FOUND" : "not found");
 
 	if (!g_SteeringUpdate || !g_IsConnected || !g_PlayLeds)
 	{
-		Log("  Required functions missing");
+		Log("  Required functions missing - this DLL may use different names");
+		Log("  Check export list above for LED-related functions");
 		FreeLibrary(m_steeringDll);
 		m_steeringDll = NULL;
 		return false;
@@ -263,7 +322,7 @@ bool LogitechLED::TrySteeringSDK()
 
 	if (ok)
 	{
-		// Init succeeded now - enumerate and test
+		// Init succeeded - enumerate and test
 		Log("  Init succeeded, enumerating...");
 
 		for (int retry = 0; retry < 10; retry++)
@@ -280,10 +339,9 @@ bool LogitechLED::TrySteeringSDK()
 		bool connected = g_IsConnected(0);
 		Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
 
-		// Only activate if wheel is actually connected AND LEDs respond
 		if (!connected)
 		{
-			Log("  Wheel not connected - steering SDK unusable");
+			Log("  Wheel not connected via this SDK");
 			if (g_SteeringShutdown) g_SteeringShutdown();
 			FreeLibrary(m_steeringDll);
 			m_steeringDll = NULL;
@@ -297,7 +355,7 @@ bool LogitechLED::TrySteeringSDK()
 
 		if (!led)
 		{
-			Log("  PlayLeds failed - steering SDK unusable");
+			Log("  PlayLeds failed");
 			if (g_SteeringShutdown) g_SteeringShutdown();
 			FreeLibrary(m_steeringDll);
 			m_steeringDll = NULL;
@@ -314,7 +372,7 @@ bool LogitechLED::TrySteeringSDK()
 		return true;
 	}
 
-	// All immediate inits failed
+	// Init failed
 	Log("  Steering SDK init failed - falling through");
 	FreeLibrary(m_steeringDll);
 	m_steeringDll = NULL;
@@ -341,27 +399,7 @@ bool LogitechLED::TrySDK()
 	}
 
 	Log("  Loaded: %s", dllPath);
-
-	// Enumerate ALL exports from the DLL using PE export table
-	Log("  --- ALL DLL EXPORTS ---");
-	BYTE* base = (BYTE*)m_sdkDll;
-	IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-	if (dos->e_magic == IMAGE_DOS_SIGNATURE)
-	{
-		IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-		if (nt->Signature == IMAGE_NT_SIGNATURE)
-		{
-			DWORD expRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-			if (expRVA)
-			{
-				IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)(base + expRVA);
-				DWORD* names = (DWORD*)(base + exp->AddressOfNames);
-				for (DWORD i = 0; i < exp->NumberOfNames; i++)
-					Log("    [%02lu] %s", i, (char*)(base + names[i]));
-			}
-		}
-	}
-	Log("  --- END EXPORTS ---");
+	DumpExports(m_sdkDll, "LED SDK");
 
 	g_LedInit       = (LogiLedInit_t)GetProcAddress(m_sdkDll, "LogiLedInit");
 	g_LedSetTarget  = (LogiLedSetTargetDevice_t)GetProcAddress(m_sdkDll, "LogiLedSetTargetDevice");
@@ -639,7 +677,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v6 ===");
+	Log("=== LogitechLED Init v7 ===");
 	Log("");
 
 	if (m_available) return true;
