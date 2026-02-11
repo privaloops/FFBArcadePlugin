@@ -280,12 +280,31 @@ bool LogitechLED::TrySteeringSDK()
 		bool connected = g_IsConnected(0);
 		Log("  LogiIsConnected(0) -> %s", connected ? "YES" : "NO");
 
+		// Only activate if wheel is actually connected AND LEDs respond
+		if (!connected)
+		{
+			Log("  Wheel not connected - steering SDK unusable");
+			if (g_SteeringShutdown) g_SteeringShutdown();
+			FreeLibrary(m_steeringDll);
+			m_steeringDll = NULL;
+			return false;
+		}
+
 		// Test LEDs
 		g_SteeringUpdate();
 		bool led = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
 		Log("  LogiPlayLeds(0, 100, 0, 100) -> %s *** ALL LEDs ***", led ? "OK" : "FAIL");
-		Sleep(1000);
 
+		if (!led)
+		{
+			Log("  PlayLeds failed - steering SDK unusable");
+			if (g_SteeringShutdown) g_SteeringShutdown();
+			FreeLibrary(m_steeringDll);
+			m_steeringDll = NULL;
+			return false;
+		}
+
+		Sleep(1000);
 		g_SteeringUpdate();
 		g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
 
@@ -295,14 +314,11 @@ bool LogitechLED::TrySteeringSDK()
 		return true;
 	}
 
-	// All immediate inits failed - defer to first SetLEDs call
-	// (game window will exist by then)
-	Log("  Immediate init failed - deferring to first SetLEDs call");
-	g_SteeringNeedsLateInit = true;
-	m_method = METHOD_STEERING_SDK;
-	m_available = true;
-	Log("=== LED CONTROL PENDING (Steering Wheel SDK - deferred init) ===");
-	return true;
+	// All immediate inits failed
+	Log("  Steering SDK init failed - falling through");
+	FreeLibrary(m_steeringDll);
+	m_steeringDll = NULL;
+	return false;
 }
 
 // --- Phase 1: G Hub LED SDK ---
