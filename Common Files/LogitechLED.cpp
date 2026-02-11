@@ -112,6 +112,15 @@ static int  g_sdkMaxZone = 1;     // Highest zone that returned OK
 static bool g_sdkUseGlobal = false; // Use SetLighting instead of zones
 static int  g_sdkGlobalTarget = 0x1; // Target for global SetLighting
 
+// G Hub WebSocket state (kept alive during plugin lifetime)
+static HINTERNET g_wsSession = NULL;
+static HINTERNET g_wsConnect = NULL;
+static HINTERNET g_wsHandle = NULL;
+static char g_ghubDeviceId[64] = {0};
+static char g_ghubInstanceGuid[64] = {0};
+static char g_ghubIntegrationGuid[64] = {0};
+static bool g_ghubRegistered = false;
+
 // --- LogitechLED ---
 
 LogitechLED::LogitechLED()
@@ -250,15 +259,6 @@ static bool WS_Recv(HINTERNET hWS, char* buf, int bufSize, DWORD* bytesRead)
 	*bytesRead = totalRead;
 	return totalRead > 0;
 }
-
-// G Hub WebSocket state (kept alive during plugin lifetime)
-static HINTERNET g_wsSession = NULL;
-static HINTERNET g_wsConnect = NULL;
-static HINTERNET g_wsHandle = NULL;
-static char g_ghubDeviceId[64] = {0};
-static char g_ghubInstanceGuid[64] = {0};
-static char g_ghubIntegrationGuid[64] = {0};
-static bool g_ghubRegistered = false;
 
 bool LogitechLED::TryGHubWebSocket()
 {
