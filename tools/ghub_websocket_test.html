@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html><head><title>G Hub WebSocket Explorer</title>
+<style>
+body { font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; font-size: 14px; }
+h1 { color: #0ff; }
+#log { white-space: pre-wrap; word-wrap: break-word; border: 1px solid #333; padding: 10px; max-height: 80vh; overflow-y: auto; }
+.error { color: #f44; }
+.info { color: #0ff; }
+.success { color: #0f0; }
+.separator { color: #666; }
+button { font-size: 16px; padding: 10px 20px; margin: 5px; cursor: pointer; background: #333; color: #0f0; border: 1px solid #0f0; }
+button:hover { background: #0f0; color: #000; }
+#controls { margin-bottom: 15px; }
+#copyBtn { background: #333; color: #0ff; border-color: #0ff; }
+</style></head>
+<body>
+<h1>G Hub WebSocket Explorer</h1>
+<div id="controls">
+<button onclick="runAll()">Lancer le scan complet</button>
+<button id="copyBtn" onclick="copyLog()">Copier tout le log</button>
+</div>
+<div id="log"></div>
+
+<script>
+let ws = null;
+let msgId = 1;
+let logEl = document.getElementById('log');
+
+function log(msg, cls) {
+    let span = document.createElement('span');
+    span.className = cls || '';
+    span.textContent = msg + '\n';
+    logEl.appendChild(span);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+function copyLog() {
+    navigator.clipboard.writeText(logEl.textContent).then(() => {
+        document.getElementById('copyBtn').textContent = 'Copie OK!';
+        setTimeout(() => document.getElementById('copyBtn').textContent = 'Copier tout le log', 2000);
+    });
+}
+
+function sendAndReceive(verb, path, payload) {
+    return new Promise((resolve) => {
+        let msg = { msgId: String(msgId++), verb: verb, path: path };
+        if (payload) msg.payload = payload;
+
+        let timeout = setTimeout(() => {
+            ws.onmessage = null;
+            log('  (timeout - no response)', 'error');
+            resolve(null);
+        }, 3000);
+
+        ws.onmessage = function(e) {
+            clearTimeout(timeout);
+            ws.onmessage = null;
+            try {
+                let data = JSON.parse(e.data);
+                log('  ' + JSON.stringify(data, null, 2), 'success');
+                resolve(data);
+            } catch(err) {
+                log('  ' + e.data, 'success');
+                resolve(e.data);
+            }
+        };
+
+        ws.send(JSON.stringify(msg));
+    });
+}
+
+async function testEndpoint(verb, path, payload) {
+    log('--- ' + verb + ' ' + path + ' ---', 'info');
+    if (payload) log('  payload: ' + JSON.stringify(payload), 'separator');
+    await sendAndReceive(verb, path, payload);
+    log('', '');
+}
+
+async function runAll() {
+    logEl.innerHTML = '';
+    log('=== G Hub WebSocket Explorer ===', 'info');
+    log('Connecting to ws://localhost:9010...', 'info');
+    log('', '');
+
+    try {
+        ws = new WebSocket('ws://localhost:9010', ['json']);
+    } catch(e) {
+        log('ERROR: ' + e.message, 'error');
+        return;
+    }
+
+    await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = () => reject(new Error('Connection refused - G Hub running?'));
+        setTimeout(() => reject(new Error('Timeout')), 5000);
+    }).catch(e => {
+        log('Connection FAILED: ' + e.message, 'error');
+        log('', '');
+        log('Verifie que G Hub (lghub_agent.exe) tourne.', 'error');
+        return;
+    });
+
+    if (!ws || ws.readyState !== 1) return;
+    log('Connected!', 'success');
+    log('', '');
+
+    // ============================================================
+    log('========================================', 'separator');
+    log('PHASE 1: Device Discovery', 'info');
+    log('========================================', 'separator');
+    log('', '');
+
+    await testEndpoint('GET', '/devices/list');
+    await testEndpoint('GET', '/devices/state');
+
+    // ============================================================
+    log('========================================', 'separator');
+    log('PHASE 2: Integration Registration', 'info');
+    log('========================================', 'separator');
+    log('', '');
+
+    await testEndpoint('SET', '/api/v1/integration/register', {
+        integrationIdentifier: 'ffb_arcade_plugin',
+        name: 'FFB Arcade Plugin',
+        author: 'FFBArcade',
+        description: 'LED control for racing wheels',
+        manualRegistration: true
+    });
+
+    // Try activation with different SDK types
+    let sdkTypes = ['ACTION', 'LED', 'LIGHTSYNC', 'STEERING', 'WHEEL', 'LIGHTING', 'SCREEN_SAMPLER'];
+    for (let st of sdkTypes) {
+        await testEndpoint('SET', '/api/v1/integration/activate', {
+            integrationIdentifier: 'ffb_arcade_plugin',
+            sdkType: st
+        });
+    }
+
+    // ============================================================
+    log('========================================', 'separator');
+    log('PHASE 3: Explore Endpoints', 'info');
+    log('========================================', 'separator');
+    log('', '');
+
+    let explorePaths = [
+        ['GET', '/lighting/state'],
+        ['GET', '/lighting/devices'],
+        ['GET', '/lightsync/state'],
+        ['GET', '/lightsync/devices'],
+        ['GET', '/profiles/current'],
+        ['GET', '/profiles/list'],
+        ['GET', '/features/list'],
+        ['GET', '/steering/state'],
+        ['GET', '/wheel/state'],
+        ['GET', '/sdk/state'],
+        ['GET', '/api/v1/lighting/state'],
+        ['GET', '/api/v1/lighting/devices'],
+        ['GET', '/api/v1/profiles/current'],
+        ['GET', '/api/v1/profiles/list'],
+        ['GET', '/api/v1/features/list'],
+        ['GET', '/api/v1/sdk/state'],
+    ];
+
+    for (let ep of explorePaths) {
+        await testEndpoint(ep[0], ep[1]);
+    }
+
+    // ============================================================
+    log('========================================', 'separator');
+    log('PHASE 4: LED Control Attempts', 'info');
+    log('========================================', 'separator');
+    log('', '');
+
+    await testEndpoint('SET', '/lighting/color', { red: 0, green: 100, blue: 0 });
+    await testEndpoint('SET', '/api/v1/lighting/color', { red: 0, green: 100, blue: 0 });
+    await testEndpoint('SET', '/lighting/zone', { deviceType: 'steering_wheel', zone: 0, red: 0, green: 100, blue: 0 });
+    await testEndpoint('SET', '/steering/leds', { leds: 31, device: 'steering_wheel' });
+    await testEndpoint('SET', '/wheel/leds', { leds: 31, device: 'steering_wheel' });
+
+    // ============================================================
+    log('', '');
+    log('========================================', 'separator');
+    log('DONE! Click "Copier tout le log" and paste to Claude.', 'info');
+    log('========================================', 'separator');
+
+    ws.close();
+}
+</script>
+</body></html>
