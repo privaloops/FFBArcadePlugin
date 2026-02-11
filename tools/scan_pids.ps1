@@ -3,6 +3,7 @@ $dll = "C:\Program Files\Logi\wheel_sdk\9_1_0\logi_steering_wheel_x86.dll"
 
 if (-not (Test-Path $dll)) {
     Write-Host "DLL non trouve: $dll"
+    Read-Host "Appuie sur Entree"
     exit 1
 }
 
@@ -16,14 +17,14 @@ Write-Host ""
 Write-Host "=== SCAN PIDs ==="
 
 $pids = @(
-    @("C298", "DFP"),
-    @("C299", "G25"),
-    @("C29A", "DFGT"),
-    @("C29B", "G27"),
-    @("C24F", "G29"),
-    @("C260", "G920"),
-    @("C266", "G923 PS"),
-    @("C26E", "G923 Xbox")
+    ,@("C298", "DFP")
+    ,@("C299", "G25")
+    ,@("C29A", "DFGT")
+    ,@("C29B", "G27")
+    ,@("C24F", "G29")
+    ,@("C260", "G920")
+    ,@("C266", "G923 PS")
+    ,@("C26E", "G923 Xbox")
 )
 
 foreach ($entry in $pids) {
@@ -32,8 +33,8 @@ foreach ($entry in $pids) {
     # Little-endian: swap bytes
     $le = $pidHex.Substring(2,2) + $pidHex.Substring(0,2)
     $found = $hex.Contains($le)
-    $status = if ($found) { "PRESENT" } else { "ABSENT" }
-    $mark = if ($pidHex -eq "C26E") { " <<<" } else { "" }
+    if ($found) { $status = "PRESENT" } else { $status = "ABSENT" }
+    if ($pidHex -eq "C26E") { $mark = " <<<" } else { $mark = "" }
     Write-Host ("  0x{0} ({1,-12}): {2}{3}" -f $pidHex, $name, $status, $mark)
 }
 
