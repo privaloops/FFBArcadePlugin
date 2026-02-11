@@ -788,7 +788,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v8 ===");
+	Log("=== LogitechLED Init v9 ===");
 	Log("");
 
 	if (m_available) return true;
