@@ -401,69 +401,99 @@ bool LogitechLED::TryGHubWebSocket()
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-	{
-		Log("  Register (%lu bytes): %.800s", bytesRead, buf);
-		// Extract integrationGuid from registration response
-		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-		if (g_ghubIntegrationGuid[0])
-			Log("  Registration GUID: %s", g_ghubIntegrationGuid);
-		else
-			Log("  No integrationGuid in registration response");
-	}
+		Log("  Register: %.500s", buf);
+	Sleep(1000);
 
-	// Wait for G Hub to fully process registration
-	Sleep(2000);
-
-	// Drain any intermediate messages from G Hub
-	while (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		Log("  Drained: %.200s", buf);
-
-	// --- Step 3: Activate WHEEL (with integrationGuid if available) ---
-	if (g_ghubIntegrationGuid[0])
-	{
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\","
-			"\"integrationGuid\":\"%s\"}}", msgId++, g_ghubIntegrationGuid);
-	}
-	else
-	{
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
-	}
+	// --- Step 3: Activate ACTION first (creates the integrationGuid) ---
+	snprintf(sendBuf, sizeof(sendBuf),
+		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"ACTION\"}}", msgId++);
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 	{
-		Log("  Activate WHEEL: %.300s", buf);
-		JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+		Log("  Activate ACTION: %.400s", buf);
 		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-		if (strstr(buf, "SUCCESS"))
-		{
-			g_ghubRegistered = true;
-			Log("  WHEEL OK! instance=%s integration=%s",
-				g_ghubInstanceGuid, g_ghubIntegrationGuid);
-		}
-		else
-			Log("  WHEEL failed, trying ACTION fallback...");
+		JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+		Log("  ACTION -> integrationGuid=%s instanceGuid=%s",
+			g_ghubIntegrationGuid[0] ? g_ghubIntegrationGuid : "(none)",
+			g_ghubInstanceGuid[0] ? g_ghubInstanceGuid : "(none)");
 	}
+	Sleep(1000);
 
-	// --- Step 3b: ACTION fallback ---
-	if (!g_ghubRegistered)
+	// --- Step 4: Now activate WHEEL with the GUID from ACTION ---
+	if (g_ghubIntegrationGuid[0])
 	{
+		Log("  Trying WHEEL with integrationGuid from ACTION...");
 		snprintf(sendBuf, sizeof(sendBuf),
 			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"ACTION\"}}", msgId++);
+			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\","
+			"\"integrationGuid\":\"%s\"}}", msgId++, g_ghubIntegrationGuid);
 		WS_Send(hWS, sendBuf);
 		Sleep(500);
 		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 		{
-			Log("  Activate ACTION: %.200s", buf);
-			if (!g_ghubIntegrationGuid[0])
-				JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-			if (!g_ghubInstanceGuid[0])
+			Log("  WHEEL (with GUID): %.400s", buf);
+			if (strstr(buf, "SUCCESS"))
+			{
+				g_ghubRegistered = true;
 				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+				Log("  >>> WHEEL ACTIVATED! instanceGuid=%s", g_ghubInstanceGuid);
+			}
+		}
+	}
+
+	// --- Step 4b: Try WHEEL without GUID (like the PS test did) ---
+	if (!g_ghubRegistered)
+	{
+		Log("  Trying WHEEL without GUID...");
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
+		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+		{
+			Log("  WHEEL (no GUID): %.400s", buf);
+			if (strstr(buf, "SUCCESS"))
+			{
+				g_ghubRegistered = true;
+				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+				Log("  >>> WHEEL ACTIVATED! instanceGuid=%s", g_ghubInstanceGuid);
+			}
+		}
+	}
+
+	// --- Step 4c: Try register with integrationType then WHEEL ---
+	if (!g_ghubRegistered)
+	{
+		Log("  Trying register with integrationType=SDK...");
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/register\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_wheel_sdk\","
+			"\"name\":\"FFB Wheel\",\"author\":\"FFB\","
+			"\"description\":\"Wheel LED\",\"manualRegistration\":true,"
+			"\"integrationType\":\"SDK\"}}", msgId++);
+		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+			Log("  Register SDK: %.400s", buf);
+
+		snprintf(sendBuf, sizeof(sendBuf),
+			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
+			"\"payload\":{\"integrationIdentifier\":\"ffb_wheel_sdk\",\"sdkType\":\"WHEEL\"}}", msgId++);
+		WS_Send(hWS, sendBuf);
+		Sleep(500);
+		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+		{
+			Log("  WHEEL (SDK type): %.400s", buf);
+			if (strstr(buf, "SUCCESS"))
+			{
+				g_ghubRegistered = true;
+				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+				JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
+				Log("  >>> WHEEL ACTIVATED via SDK type!");
+			}
 		}
 	}
 
@@ -1390,7 +1420,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v17 (extract registration GUID) ===");
+	Log("=== LogitechLED Init v18 (ACTION-first GUID + integrationType) ===");
 	Log("");
 
 	if (m_available) return true;
