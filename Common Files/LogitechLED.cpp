@@ -134,6 +134,16 @@ LogitechLED::~LogitechLED()
 
 void LogitechLED::Close()
 {
+	// Close G Hub WebSocket connection
+	if (g_wsHandle)
+	{
+		WinHttpWebSocketClose(g_wsHandle, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+		WinHttpCloseHandle(g_wsHandle);
+		g_wsHandle = NULL;
+	}
+	if (g_wsConnect) { WinHttpCloseHandle(g_wsConnect); g_wsConnect = NULL; }
+	if (g_wsSession) { WinHttpCloseHandle(g_wsSession); g_wsSession = NULL; }
+
 	if (m_method == METHOD_STEERING_SDK)
 	{
 		if (g_SteeringShutdown) g_SteeringShutdown();
@@ -241,7 +251,10 @@ static bool WS_Recv(HINTERNET hWS, char* buf, int bufSize, DWORD* bytesRead)
 	return totalRead > 0;
 }
 
-// G Hub WebSocket registration state
+// G Hub WebSocket state (kept alive during plugin lifetime)
+static HINTERNET g_wsSession = NULL;
+static HINTERNET g_wsConnect = NULL;
+static HINTERNET g_wsHandle = NULL;
 static char g_ghubDeviceId[64] = {0};
 static char g_ghubInstanceGuid[64] = {0};
 static char g_ghubIntegrationGuid[64] = {0};
@@ -249,93 +262,57 @@ static bool g_ghubRegistered = false;
 
 bool LogitechLED::TryGHubWebSocket()
 {
-	Log("=== Phase -1: G Hub WebSocket Registration ===");
+	Log("=== Phase -1: G Hub WebSocket (keep-alive) ===");
 
-	Log("  Opening WinHTTP session...");
 	HINTERNET hSession = WinHttpOpen(L"FFBArcadePlugin/1.0",
 		WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
-	if (!hSession) { Log("  WinHttpOpen failed (err=%lu)", GetLastError()); return false; }
+	if (!hSession) { Log("  WinHttpOpen failed"); return false; }
 
-	// Set timeouts: 5s connect, 5s send, 5s receive
 	DWORD timeout = 5000;
 	WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
 	WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
 	WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
-	DWORD resolveTimeout = 3000;
-	WinHttpSetOption(hSession, WINHTTP_OPTION_RESOLVE_TIMEOUT, &resolveTimeout, sizeof(resolveTimeout));
 
-	Log("  Connecting to localhost:9010...");
 	HINTERNET hConnect = WinHttpConnect(hSession, L"localhost", 9010, 0);
-	if (!hConnect) { Log("  WinHttpConnect failed (err=%lu)", GetLastError()); WinHttpCloseHandle(hSession); return false; }
+	if (!hConnect) { WinHttpCloseHandle(hSession); Log("  Connect failed"); return false; }
 
-	Log("  Opening request...");
 	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", L"/",
 		NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-	if (!hRequest)
-	{
-		Log("  WinHttpOpenRequest failed (err=%lu)", GetLastError());
-		WinHttpCloseHandle(hConnect);
-		WinHttpCloseHandle(hSession);
-		return false;
-	}
+	if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
 
-	// Enable WebSocket upgrade
-	Log("  Setting WebSocket option...");
-	BOOL optResult = WinHttpSetOption(hRequest,
-		WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
-	if (!optResult) { Log("  WebSocket option failed (err=%lu)", GetLastError()); }
-
-	// Add required headers
+	WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
 	WinHttpAddRequestHeaders(hRequest,
 		L"Sec-WebSocket-Protocol: json\r\nOrigin: file://",
 		(DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
-	// Send the upgrade request
-	Log("  Sending upgrade request...");
-	BOOL sent = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0);
-	if (!sent)
+	if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) ||
+		!WinHttpReceiveResponse(hRequest, NULL))
 	{
-		Log("  WinHttpSendRequest failed (err=%lu)", GetLastError());
-		WinHttpCloseHandle(hRequest);
-		WinHttpCloseHandle(hConnect);
-		WinHttpCloseHandle(hSession);
+		Log("  WebSocket handshake failed (err=%lu)", GetLastError());
+		WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 		return false;
 	}
 
-	Log("  Waiting for response...");
-	BOOL received = WinHttpReceiveResponse(hRequest, NULL);
-	if (!received)
-	{
-		Log("  WinHttpReceiveResponse failed (err=%lu)", GetLastError());
-		WinHttpCloseHandle(hRequest);
-		WinHttpCloseHandle(hConnect);
-		WinHttpCloseHandle(hSession);
-		return false;
-	}
-
-	Log("  Completing WebSocket upgrade...");
 	HINTERNET hWS = WinHttpWebSocketCompleteUpgrade(hRequest, 0);
-	WinHttpCloseHandle(hRequest); // No longer needed after upgrade
+	WinHttpCloseHandle(hRequest);
 	if (!hWS)
 	{
-		Log("  WebSocket upgrade failed (err=%lu)", GetLastError());
-		WinHttpCloseHandle(hConnect);
-		WinHttpCloseHandle(hSession);
+		Log("  WebSocket upgrade failed");
+		WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 		return false;
 	}
 
-	Log("  WebSocket connected to G Hub!");
+	Log("  WebSocket connected!");
 
 	char buf[65536];
 	DWORD bytesRead = 0;
 	char sendBuf[1024];
 	int msgId = 1;
 
-	// Drain initial OPTIONS message
+	// Drain initial message
 	WS_Recv(hWS, buf, sizeof(buf), &bytesRead);
-	if (bytesRead > 0) Log("  Initial: %.200s...", buf);
 
-	// --- Step 1: GET /devices/list ---
+	// --- Get device list, find steering wheel ---
 	snprintf(sendBuf, sizeof(sendBuf),
 		"{\"msgId\":\"%d\",\"verb\":\"GET\",\"path\":\"/devices/list\"}", msgId++);
 	WS_Send(hWS, sendBuf);
@@ -343,253 +320,74 @@ bool LogitechLED::TryGHubWebSocket()
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 	{
 		Log("  /devices/list -> %lu bytes", bytesRead);
-
-		// Debug: dump JSON start to see actual formatting
-		Log("  JSON[0..300]: %.300s", buf);
-
-		// Fix: search for plain "STEERING_WHEEL" (G Hub JSON has spaces after colons)
 		const char* swPos = strstr(buf, "STEERING_WHEEL");
 		if (swPos)
 		{
-			Log("  STEERING_WHEEL at offset %d", (int)(swPos - buf));
-
-			// Search backwards for device ID pattern "dev0..."
 			const char* p = buf;
 			const char* lastDev = NULL;
 			while (p < swPos)
 			{
 				const char* found = strstr(p, "\"dev0");
-				if (found && found < swPos)
-				{
-					lastDev = found + 1; // skip opening quote
-					p = found + 5;
-				}
+				if (found && found < swPos) { lastDev = found + 1; p = found + 5; }
 				else break;
 			}
-
 			if (lastDev)
 			{
 				int i = 0;
 				while (lastDev[i] && lastDev[i] != '"' && i < 63)
-				{
-					g_ghubDeviceId[i] = lastDev[i];
-					i++;
-				}
+					g_ghubDeviceId[i] = lastDev[i], i++;
 				g_ghubDeviceId[i] = 0;
-				Log("  Found steering wheel: %s", g_ghubDeviceId);
+				Log("  Steering wheel: %s", g_ghubDeviceId);
 			}
-			else
-				Log("  STEERING_WHEEL found but no device ID nearby");
-
-			// Dump context around STEERING_WHEEL
-			int ctxStart = (int)(swPos - buf);
-			if (ctxStart > 200) ctxStart -= 200; else ctxStart = 0;
-			Log("  Context: %.400s", buf + ctxStart);
 		}
 		else
-			Log("  No STEERING_WHEEL in %lu bytes", bytesRead);
+			Log("  No STEERING_WHEEL found");
 	}
-	else
-		Log("  No response to /devices/list");
 
-	// --- Step 2: Register integration ---
+	// --- Register with dedicated identifier for WHEEL ---
 	snprintf(sendBuf, sizeof(sendBuf),
 		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/register\","
-		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\","
-		"\"name\":\"FFB Arcade Plugin\",\"author\":\"FFB\","
-		"\"description\":\"RPM LED control\",\"manualRegistration\":true}}", msgId++);
+		"\"payload\":{\"integrationIdentifier\":\"ffb_wheel\","
+		"\"name\":\"FFB Wheel\",\"author\":\"FFB\","
+		"\"description\":\"Wheel LED control\",\"manualRegistration\":true}}", msgId++);
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		Log("  Register: %.500s", buf);
-	Sleep(1000);
+		Log("  Register: %s", strstr(buf, "SUCCESS") ? "OK" : "FAIL");
 
-	// --- Step 3: Activate ACTION first (creates the integrationGuid) ---
+	// --- Activate WHEEL ---
 	snprintf(sendBuf, sizeof(sendBuf),
 		"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-		"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"ACTION\"}}", msgId++);
+		"\"payload\":{\"integrationIdentifier\":\"ffb_wheel\",\"sdkType\":\"WHEEL\"}}", msgId++);
 	WS_Send(hWS, sendBuf);
 	Sleep(500);
 	if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
 	{
-		Log("  Activate ACTION: %.400s", buf);
-		JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-		JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
-		Log("  ACTION -> integrationGuid=%s instanceGuid=%s",
-			g_ghubIntegrationGuid[0] ? g_ghubIntegrationGuid : "(none)",
-			g_ghubInstanceGuid[0] ? g_ghubInstanceGuid : "(none)");
-	}
-	Sleep(1000);
-
-	// --- Step 4: Now activate WHEEL with the GUID from ACTION ---
-	if (g_ghubIntegrationGuid[0])
-	{
-		Log("  Trying WHEEL with integrationGuid from ACTION...");
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\","
-			"\"integrationGuid\":\"%s\"}}", msgId++, g_ghubIntegrationGuid);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
+		Log("  Activate WHEEL: %.400s", buf);
+		if (strstr(buf, "SUCCESS"))
 		{
-			Log("  WHEEL (with GUID): %.400s", buf);
-			if (strstr(buf, "SUCCESS"))
-			{
-				g_ghubRegistered = true;
-				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
-				Log("  >>> WHEEL ACTIVATED! instanceGuid=%s", g_ghubInstanceGuid);
-			}
+			g_ghubRegistered = true;
+			JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
+			JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
+			Log("  >>> WHEEL ACTIVE! Keeping WebSocket alive for SDK detection.");
+
+			// Store handles - DON'T close the connection!
+			g_wsSession = hSession;
+			g_wsConnect = hConnect;
+			g_wsHandle = hWS;
+			return false; // Continue to Phase 0 with WS alive
 		}
+		else
+			Log("  WHEEL activation failed");
 	}
 
-	// --- Step 4b: Try WHEEL without GUID (like the PS test did) ---
-	if (!g_ghubRegistered)
-	{
-		Log("  Trying WHEEL without GUID...");
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_arcade\",\"sdkType\":\"WHEEL\"}}", msgId++);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		{
-			Log("  WHEEL (no GUID): %.400s", buf);
-			if (strstr(buf, "SUCCESS"))
-			{
-				g_ghubRegistered = true;
-				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
-				Log("  >>> WHEEL ACTIVATED! instanceGuid=%s", g_ghubInstanceGuid);
-			}
-		}
-	}
-
-	// --- Step 4c: Try register with integrationType then WHEEL ---
-	if (!g_ghubRegistered)
-	{
-		Log("  Trying register with integrationType=SDK...");
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/register\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_wheel_sdk\","
-			"\"name\":\"FFB Wheel\",\"author\":\"FFB\","
-			"\"description\":\"Wheel LED\",\"manualRegistration\":true,"
-			"\"integrationType\":\"SDK\"}}", msgId++);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  Register SDK: %.400s", buf);
-
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/integration/activate\","
-			"\"payload\":{\"integrationIdentifier\":\"ffb_wheel_sdk\",\"sdkType\":\"WHEEL\"}}", msgId++);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		{
-			Log("  WHEEL (SDK type): %.400s", buf);
-			if (strstr(buf, "SUCCESS"))
-			{
-				g_ghubRegistered = true;
-				JsonGetString(buf, "instanceGuid", g_ghubInstanceGuid, sizeof(g_ghubInstanceGuid));
-				JsonGetString(buf, "integrationGuid", g_ghubIntegrationGuid, sizeof(g_ghubIntegrationGuid));
-				Log("  >>> WHEEL ACTIVATED via SDK type!");
-			}
-		}
-	}
-
-	// --- Step 4: HID++ LED commands via WebSocket ---
-	// If G Hub can relay HID++ to the wheel, this bypasses the kernel driver
-	if (g_ghubDeviceId[0])
-	{
-		Log("  --- HID++ LED tests via WebSocket ---");
-
-		// A) HID++ setup: [0x11,0xFF,0x12,0x31,0x00] = feat 0x12, func 3 (enable)
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/hid\","
-			"\"payload\":{\"data\":[17,255,18,49,0]}}", msgId++, g_ghubDeviceId);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  HID++ setup -> %.200s", buf);
-
-		// B) HID++ LEDs ALL ON: [0x11,0xFF,0x12,0x51,0x00,0x05,0x1F]
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/hid\","
-			"\"payload\":{\"data\":[17,255,18,81,0,5,31]}}", msgId++, g_ghubDeviceId);
-		WS_Send(hWS, sendBuf);
-		Sleep(500);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-		{
-			Log("  HID++ LEDs -> %.200s", buf);
-			if (strstr(buf, "SUCCESS"))
-			{
-				Log("  >>> HID++ ACCEPTED! CHECK WHEEL LEDs! (3s)");
-				Sleep(3000);
-			}
-		}
-
-		// C) Alternate HID path
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/devices/%s/hid\","
-			"\"payload\":{\"data\":[17,255,18,81,0,5,31]}}", msgId++, g_ghubDeviceId);
-		WS_Send(hWS, sendBuf);
-		Sleep(300);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  HID++ (alt path) -> %.200s", buf);
-
-		// D) WHEEL SDK RPM endpoint (if WHEEL activation succeeded)
-		if (g_ghubInstanceGuid[0])
-		{
-			snprintf(sendBuf, sizeof(sendBuf),
-				"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/sdk/wheel/rpm\","
-				"\"payload\":{\"instanceGuid\":\"%s\",\"deviceId\":\"%s\","
-				"\"currentRpm\":8000,\"rpmMax\":9000,\"rpmRedLine\":8500}}",
-				msgId++, g_ghubInstanceGuid, g_ghubDeviceId);
-			WS_Send(hWS, sendBuf);
-			Sleep(500);
-			if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			{
-				Log("  WHEEL RPM -> %.200s", buf);
-				if (strstr(buf, "SUCCESS"))
-				{
-					Log("  >>> RPM ACCEPTED! CHECK WHEEL LEDs! (3s)");
-					Sleep(3000);
-				}
-			}
-		}
-
-		// E) Direct LED endpoints
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/wheel/leds\","
-			"\"payload\":{\"deviceId\":\"%s\",\"leds\":31,"
-			"\"instanceGuid\":\"%s\",\"integrationGuid\":\"%s\"}}",
-			msgId++, g_ghubDeviceId, g_ghubInstanceGuid, g_ghubIntegrationGuid);
-		WS_Send(hWS, sendBuf);
-		Sleep(300);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  /wheel/leds -> %.200s", buf);
-
-		snprintf(sendBuf, sizeof(sendBuf),
-			"{\"msgId\":\"%d\",\"verb\":\"SET\",\"path\":\"/api/v1/devices/%s/leds\","
-			"\"payload\":{\"leds\":31}}", msgId++, g_ghubDeviceId);
-		WS_Send(hWS, sendBuf);
-		Sleep(300);
-		if (WS_Recv(hWS, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
-			Log("  /devices/leds -> %.200s", buf);
-	}
-	else
-		Log("  No deviceId - skipping LED tests");
-
-	// Keep WebSocket open briefly then close
+	// WHEEL failed - close everything
 	WinHttpWebSocketClose(hWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
 	WinHttpCloseHandle(hWS);
 	WinHttpCloseHandle(hConnect);
 	WinHttpCloseHandle(hSession);
-
-	Log("  WebSocket done: device=%s registered=%s",
-		g_ghubDeviceId[0] ? g_ghubDeviceId : "none",
-		g_ghubRegistered ? "yes" : "no");
-	return false; // Diagnostic only - other phases handle LED control
+	Log("  WebSocket closed (WHEEL not available)");
+	return false;
 }
 
 // --- Phase 0: Logitech Steering Wheel SDK ---
@@ -1420,7 +1218,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v18 (ACTION-first GUID + integrationType) ===");
+	Log("=== LogitechLED Init v19 (keep WS alive for SDK detection) ===");
 	Log("");
 
 	if (m_available) return true;
