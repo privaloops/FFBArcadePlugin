@@ -6,6 +6,7 @@
 #include <hidpi.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <objbase.h>
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -412,11 +413,54 @@ bool LogitechLED::TrySteeringSDK()
 			Log("  PlayLeds failed despite connection");
 		}
 
-		// Fallback: SDK doesn't know G923 PID, try LogiPlayLedsDInput
-		// Create a REAL DirectInput device bypassing our wrapper
+		// === Fallback A: Try LogiPlayLeds(0) even without IsConnected ===
+		// The SDK communicates with G Hub via IPC - maybe the command goes through anyway
+		Log("  Fallback A: LogiPlayLeds(0) despite IsConnected=NO...");
+		g_SteeringUpdate();
+		{
+			bool ledA = g_PlayLeds(0, 100.0f, 0.0f, 100.0f);
+			Log("  LogiPlayLeds(0, 100, 0, 100) -> %s", ledA ? "OK" : "FAIL");
+			if (ledA)
+			{
+				Log("  *** LEDs responded despite IsConnected=NO! ***");
+				Sleep(2000);
+				g_SteeringUpdate();
+				g_PlayLeds(0, 0.0f, 0.0f, 100.0f);
+				m_method = METHOD_STEERING_SDK;
+				m_available = true;
+				Log("=== LED CONTROL ACTIVE (Steering SDK, blind) ===");
+				return true;
+			}
+		}
+
+		// === Fallback B: LogiPlayLedsDInput(NULL) without device ===
 		if (g_PlayLedsDInput)
 		{
-			Log("  Trying LogiPlayLedsDInput fallback...");
+			Log("  Fallback B: LogiPlayLedsDInput(NULL)...");
+			g_SteeringUpdate();
+			bool ledB = g_PlayLedsDInput(NULL, 100.0f, 0.0f, 100.0f);
+			Log("  LogiPlayLedsDInput(NULL, 100, 0, 100) -> %s", ledB ? "OK" : "FAIL");
+			if (ledB)
+			{
+				Log("  *** LEDs responded with NULL device! ***");
+				Sleep(2000);
+				g_SteeringUpdate();
+				g_PlayLedsDInput(NULL, 0.0f, 0.0f, 100.0f);
+				m_method = METHOD_STEERING_SDK;
+				m_available = true;
+				Log("=== LED CONTROL ACTIVE (Steering SDK + DInput NULL) ===");
+				return true;
+			}
+		}
+
+		// === Fallback C: Create a REAL DirectInput device, pass to LogiPlayLedsDInput ===
+		if (g_PlayLedsDInput)
+		{
+			Log("  Fallback C: Real DirectInput device...");
+
+			// Ensure COM is initialized (required for DirectInput)
+			HRESULT comHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+			Log("  CoInitializeEx -> 0x%08lX", comHr);
 
 			// Load the real system dinput8.dll
 			char sysDir[MAX_PATH];
@@ -425,76 +469,105 @@ bool LogitechLED::TrySteeringSDK()
 
 			typedef HRESULT (WINAPI *DI8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 			HMODULE realDIDll = LoadLibraryA(sysDir);
+			HMODULE ourDll = GetModuleHandleA("dinput8.dll");
+			Log("  Real dinput8.dll: %s -> HMODULE=0x%p", sysDir, realDIDll);
+			Log("  Our dinput8.dll: HMODULE=0x%p (same=%s)",
+				ourDll, (realDIDll == ourDll) ? "YES!" : "no");
+
 			if (!realDIDll)
 			{
-				Log("  Failed to load real dinput8.dll from %s", sysDir);
+				Log("  Failed to load real dinput8.dll");
+			}
+			else if (realDIDll == ourDll)
+			{
+				Log("  ERROR: System dinput8.dll resolved to our wrapper!");
+				Log("  Trying alternative: loading from SysWOW64 explicitly...");
+				FreeLibrary(realDIDll);
+				realDIDll = LoadLibraryA("C:\\Windows\\SysWOW64\\dinput8.dll");
+				Log("  SysWOW64 dinput8.dll -> HMODULE=0x%p (same=%s)",
+					realDIDll, (realDIDll == ourDll) ? "YES!" : "no");
+			}
+
+			DI8Create_t realCreate = NULL;
+			if (realDIDll)
+				realCreate = (DI8Create_t)GetProcAddress(realDIDll, "DirectInput8Create");
+
+			if (!realCreate)
+			{
+				Log("  DirectInput8Create not found in real dll");
 			}
 			else
 			{
-				DI8Create_t realCreate = (DI8Create_t)GetProcAddress(realDIDll, "DirectInput8Create");
-				if (!realCreate)
-				{
-					Log("  DirectInput8Create not found in real dll");
-					FreeLibrary(realDIDll);
-				}
-				else
-				{
-					HRESULT hr = realCreate(GetModuleHandle(NULL), DIRECTINPUT_VERSION,
-						IID_IDirectInput8A, (LPVOID*)&g_realDI, NULL);
-					Log("  Real DirectInput8Create -> 0x%08lX", hr);
+				Log("  realCreate=0x%p", realCreate);
 
-					if (SUCCEEDED(hr) && g_realDI)
+				HRESULT hr = realCreate(GetModuleHandle(NULL), DIRECTINPUT_VERSION,
+					IID_IDirectInput8A, (LPVOID*)&g_realDI, NULL);
+				Log("  Real DirectInput8Create -> 0x%08lX, DI=0x%p", hr, g_realDI);
+
+				if (SUCCEEDED(hr) && g_realDI)
+				{
+					// Enumerate ALL devices to find a Logitech wheel
+					EnumWheelCtx enumCtx;
+					memset(&enumCtx, 0, sizeof(enumCtx));
+
+					Log("  Enumerating ALL DirectInput devices (class=0, flags=ALLDEVICES)...");
+					HRESULT enumHr = g_realDI->EnumDevices(0,
+						EnumWheelCB, &enumCtx, DIEDFL_ALLDEVICES);
+					Log("  EnumDevices(ALL) returned 0x%08lX, found=%d",
+						enumHr, enumCtx.found ? 1 : 0);
+
+					// Also try specifically game controllers
+					if (!enumCtx.found)
 					{
-						// Enumerate ALL devices to find a Logitech wheel
-						EnumWheelCtx enumCtx;
+						Log("  Retrying with DI8DEVCLASS_GAMECTRL + ATTACHEDONLY...");
 						memset(&enumCtx, 0, sizeof(enumCtx));
+						enumHr = g_realDI->EnumDevices(DI8DEVCLASS_GAMECTRL,
+							EnumWheelCB, &enumCtx, DIEDFL_ATTACHEDONLY);
+						Log("  EnumDevices(GAMECTRL) returned 0x%08lX, found=%d",
+							enumHr, enumCtx.found ? 1 : 0);
+					}
 
-						Log("  Enumerating ALL DirectInput devices...");
-						HRESULT enumHr = g_realDI->EnumDevices(0,
-							EnumWheelCB, &enumCtx, DIEDFL_ALLDEVICES);
-						Log("  EnumDevices returned 0x%08lX, found=%d",
-							enumHr, enumCtx.found);
+					if (!enumCtx.found)
+					{
+						Log("  No Logitech wheel found via real DirectInput");
+						g_realDI->Release();
+						g_realDI = NULL;
+					}
+					else
+					{
+						hr = g_realDI->CreateDevice(enumCtx.guid, &g_realDIDevice, NULL);
+						Log("  CreateDevice -> 0x%08lX", hr);
 
-						if (!enumCtx.found)
+						if (SUCCEEDED(hr) && g_realDIDevice)
 						{
-							Log("  No Logitech wheel found via real DirectInput");
-							g_realDI->Release();
-							g_realDI = NULL;
-						}
-						else
-						{
-							hr = g_realDI->CreateDevice(enumCtx.guid, &g_realDIDevice, NULL);
-							Log("  CreateDevice -> 0x%08lX", hr);
+							// Test LogiPlayLedsDInput
+							g_SteeringUpdate();
+							bool led = g_PlayLedsDInput(g_realDIDevice, 100.0f, 0.0f, 100.0f);
+							Log("  LogiPlayLedsDInput(dev, 100, 0, 100) -> %s *** ALL LEDs ***",
+								led ? "OK" : "FAIL");
 
-							if (SUCCEEDED(hr) && g_realDIDevice)
+							if (led)
 							{
-								// Test LogiPlayLedsDInput
+								Sleep(1000);
 								g_SteeringUpdate();
-								bool led = g_PlayLedsDInput(g_realDIDevice, 100.0f, 0.0f, 100.0f);
-								Log("  LogiPlayLedsDInput(dev, 100, 0, 100) -> %s *** ALL LEDs ***",
-									led ? "OK" : "FAIL");
-
-								if (led)
-								{
-									Sleep(1000);
-									g_SteeringUpdate();
-									g_PlayLedsDInput(g_realDIDevice, 0.0f, 0.0f, 100.0f);
-									m_method = METHOD_STEERING_SDK;
-									m_available = true;
-									Log("=== LED CONTROL ACTIVE (Steering SDK + DInput) ===");
-									return true;
-								}
-
-								// Cleanup on failure
-								g_realDIDevice->Release();
-								g_realDIDevice = NULL;
+								g_PlayLedsDInput(g_realDIDevice, 0.0f, 0.0f, 100.0f);
+								m_method = METHOD_STEERING_SDK;
+								m_available = true;
+								Log("=== LED CONTROL ACTIVE (Steering SDK + DInput) ===");
+								return true;
 							}
-							g_realDI->Release();
-							g_realDI = NULL;
+
+							// Cleanup on failure
+							g_realDIDevice->Release();
+							g_realDIDevice = NULL;
 						}
+						g_realDI->Release();
+						g_realDI = NULL;
 					}
 				}
 			}
+
+			if (SUCCEEDED(comHr)) CoUninitialize();
 		}
 
 		Log("  Steering SDK exhausted - falling through");
@@ -804,7 +877,7 @@ bool LogitechLED::TryLegacy(HANDLE h, USHORT outLen)
 
 bool LogitechLED::Init()
 {
-	Log("=== LogitechLED Init v10 ===");
+	Log("=== LogitechLED Init v11 ===");
 	Log("");
 
 	if (m_available) return true;
@@ -813,9 +886,10 @@ bool LogitechLED::Init()
 	if (TrySteeringSDK())
 		return true;
 
-	// Phase 1: G Hub LED SDK (diagnostic - enumerate exports, scan zones)
+	// Phase 1: G Hub LED SDK
 	Log("");
-	TrySDK();  // always returns false now, just diagnostic
+	if (TrySDK())
+		return true;
 
 	// Phase 2: HID enumeration + Legacy attempt
 	Log("");
